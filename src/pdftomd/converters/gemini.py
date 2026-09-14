@@ -7,7 +7,7 @@ import time
 
 from .base import ConversionError, Converter, guess_mime
 
-DEFAULT_MODEL = "gemini-1.5-flash"
+DEFAULT_MODEL = "gemini-2.5-flash"
 INLINE_LIMIT_BYTES = 19 * 1024 * 1024  # Gemini inline request limit is ~20MB
 
 SYSTEM_PROMPT = """\

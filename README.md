@@ -9,7 +9,7 @@ Two conversion engines are available, selectable with `--engine`:
 | engine   | how it works                                                                | good for                                               |
 |----------|-----------------------------------------------------------------------------|--------------------------------------------------------|
 | `marker` | local, [marker-pdf](https://github.com/datalab-to/marker) (layout + OCR)    | offline, private documents; `--force-ocr` for bad scans |
-| `gemini` | Google Gemini API (default model `gemini-1.5-flash`, configurable)          | poor scans, multi-page tables seen in full context      |
+| `gemini` | Google Gemini API (default model `gemini-2.5-flash`, configurable)          | poor scans, multi-page tables seen in full context      |
 
 ## Install
 
@@ -31,7 +31,7 @@ pdftomd sync  ./docs ./docs-md --dry-run
 
 # Incremental sync: only new / changed / missing outputs are regenerated.
 pdftomd sync ./docs ./docs-md --engine marker --force-ocr
-pdftomd sync ./docs ./docs-md --engine gemini --gemini-model gemini-2.5-flash
+pdftomd sync ./docs ./docs-md --engine gemini --gemini-model gemini-2.5-pro
 
 # Force specific files (relative to the source dir), even if up to date.
 pdftomd sync ./docs ./docs-md --select reports/2024/q3.pdf --select scans/invoice.png

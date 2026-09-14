@@ -9,6 +9,7 @@ import typer
 
 from . import __version__
 from .converters import ENGINES, ConversionError, get_converter
+from .converters.gemini import DEFAULT_MODEL
 from .sync import PlannedItem, Syncer, SyncPlan
 
 app = typer.Typer(
@@ -21,7 +22,7 @@ Engine = typer.Option("marker", "--engine", "-e", help=f"Conversion backend: {',
 ForceOcr = typer.Option(False, "--force-ocr", help="(marker) Re-OCR every page (best for poor scans).")
 UseLlm = typer.Option(False, "--use-llm", help="(marker) Hybrid LLM mode for better tables/forms (needs GOOGLE_API_KEY).")
 Langs = typer.Option(None, "--lang", help="(marker) OCR language(s), e.g. --lang en --lang fr.")
-GeminiModel = typer.Option("gemini-1.5-flash", "--gemini-model", help="(gemini) Model name.")
+GeminiModel = typer.Option(DEFAULT_MODEL, "--gemini-model", help="(gemini) Model name.")
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
 
 
@@ -108,7 +109,7 @@ def list_cmd(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
 ) -> None:
     """List the documents that would be (re)generated, without converting anything."""
-    conv = _converter(engine, False, False, None, "gemini-1.5-flash", None)
+    conv = _converter(engine, False, False, None, DEFAULT_MODEL, None)
     _print_plan(Syncer(source, dest, conv).plan(), verbose=verbose)
 
 
