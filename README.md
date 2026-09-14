@@ -87,6 +87,26 @@ implement `convert_bytes(data, *, filename) -> str`.
   guess, temperature 0). Files over ~20 MB go through the Files API; output
   truncated at the token limit is continued automatically.
 
+## Troubleshooting
+
+**`CERTIFICATE_VERIFY_FAILED ... self-signed certificate in certificate chain`**
+when marker downloads its models: you are behind a TLS-inspecting proxy
+(Netskope, Zscaler, ...). Python does not use the macOS keychain, so export the
+system roots and point Python at them:
+
+```bash
+mkdir -p ~/.config/pdftomd
+{ security find-certificate -a -p /Library/Keychains/System.keychain
+  security find-certificate -a -p /System/Library/Keychains/SystemRootCertificates.keychain
+} > ~/.config/pdftomd/ca-bundle.pem
+export SSL_CERT_FILE=~/.config/pdftomd/ca-bundle.pem
+export REQUESTS_CA_BUNDLE=~/.config/pdftomd/ca-bundle.pem
+```
+
+Add the two `export` lines to your shell profile to make it permanent. The
+first marker run downloads ~2.6 GB of models into `~/Library/Caches/datalab`
+and can look idle for several minutes; later runs start immediately.
+
 ## Development
 
 ```bash
