@@ -1,0 +1,31 @@
+[project]
+name = "pdftomd"
+version = "0.1.0"
+description = "Convert a directory tree of documents (PDF, images, ...) into Markdown, incrementally."
+readme = "README.md"
+requires-python = ">=3.10,<3.14"
+license = { text = "MIT" }
+dependencies = [
+    "typer>=0.12,<1.0",
+]
+
+[project.optional-dependencies]
+marker = ["marker-pdf>=1.5,<2.0"]
+gemini = ["google-genai>=1.0,<2.0"]
+all = ["pdftomd[marker,gemini]"]
+
+[project.scripts]
+pdftomd = "pdftomd.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pdftomd"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
