@@ -11,12 +11,17 @@ Two conversion engines are available, selectable with `--engine`:
 | `marker` | local, [marker-pdf](https://github.com/datalab-to/marker) (layout + OCR)    | offline, private documents; `--force-ocr` for bad scans |
 | `gemini` | Google Gemini API (default model `gemini-3.6-flash`, configurable)          | poor scans, multi-page tables seen in full context      |
 
+Google Docs / Sheets / Slides synced by Google Drive for Desktop (`.gdoc`,
+`.gsheet`, `.gslides` stubs whose content lives online) are fetched through the
+Drive API, see [Google Drive documents](#google-drive-documents).
+
 ## Install
 
 ```bash
 uv sync --group dev                 # core + tests
 uv sync --extra marker              # + marker-pdf (downloads models on first run)
 uv sync --extra gemini              # + google-genai (needs GEMINI_API_KEY)
+uv sync --extra gdrive              # + Google Drive API client + openpyxl
 uv sync --extra all
 ```
 
@@ -54,6 +59,42 @@ hash changed, the engine changed, its `.md` is missing, or it was selected /
 forced. A touched-but-identical file is *not* regenerated. Destination files
 whose source vanished are reported as orphans and only deleted with `--prune`.
 
+## Google Drive documents
+
+Google Drive for Desktop stores native documents as 170-byte JSON stubs
+containing only a `doc_id`. pdftomd resolves them through the Drive API
+(read-only scope) when logged in:
+
+| stub        | how it becomes Markdown                                            | manifest engine |
+|-------------|--------------------------------------------------------------------|-----------------|
+| `.gdoc`     | Drive's native `text/markdown` export (no OCR involved)            | `gdrive`        |
+| `.gsheet`   | exported as `.xlsx`, every visible tab rendered as a GFM table     | `gdrive`        |
+| `.gslides`  | exported as PDF, then converted by the selected `--engine`         | engine name     |
+
+Change detection uses the remote `version` / `modifiedTime` as fingerprint,
+since the stub bytes never change when the document is edited online. Each
+`sync` costs one small metadata call per stub; content is downloaded only for
+stale documents.
+
+### One-time setup
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a
+   project, enable the **Google Drive API**, and create an **OAuth client ID**
+   of type *Desktop app*. On the consent screen add your own Google account as
+   a test user (a personal tool does not need app verification).
+2. Download the client JSON to `~/.config/pdftomd/client_secret.json`
+   (or pass `--client-secret PATH`).
+3. `pdftomd gdrive login` opens the browser once; the refreshable token is stored
+   in `~/.config/pdftomd/google-token.json` (mode 600).
+
+`pdftomd gdrive status` / `pdftomd gdrive logout` inspect and clear the state.
+Set `PDFTOMD_CONFIG_DIR` to relocate these files.
+
+Once a token exists, Drive support is on by default for `sync`, `list`, `watch`
+and `convert`; use `--no-gdrive` to treat stubs as unsupported files. Stubs
+whose metadata cannot be fetched (offline, no access) are reported as errors and
+retried on the next run; the previous `.md`, if any, is left in place.
+
 ## Library
 
 ```python
@@ -72,6 +113,11 @@ for item in plan.to_generate:
     print(item.reason.value, item.rel_path)
 result = syncer.execute(plan, prune=False)    # writes .md files + manifest
 result = syncer.sync(select=["a/b.pdf"])      # force selected files
+
+# Google Drive stubs (after `pdftomd gdrive login`).
+from pdftomd.gdrive import GoogleDriveResolver
+md = convert_file("notes.gdoc")                       # Markdown straight from Drive
+syncer = Syncer("docs", "docs-md", get_converter("marker"), gdrive=GoogleDriveResolver())
 ```
 
 Custom backends: subclass `pdftomd.Converter`, set `name` / `extensions`, and

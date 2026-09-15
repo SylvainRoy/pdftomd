@@ -37,8 +37,20 @@ def convert_bytes(data: bytes, *, filename: str, engine: str = "marker", **optio
     return get_converter(engine, **options).convert_bytes(data, filename=filename)
 
 
-def convert_file(path: str | Path, *, engine: str = "marker", **options: Any) -> str:
-    """File-level API: read a document from disk and return its Markdown."""
+def convert_file(path: str | Path, *, engine: str = "marker", gdrive: Any = None, **options: Any) -> str:
+    """File-level API: read a document from disk and return its Markdown.
+
+    ``.gdoc`` / ``.gsheet`` / ``.gslides`` stubs are fetched from Google Drive
+    (``gdrive`` may be a configured ``GoogleDriveResolver``; a default one is
+    created otherwise). Slides go through ``engine`` after export to PDF.
+    """
+    from .gdrive import GoogleDriveResolver, is_stub
+
+    if is_stub(path):
+        doc = (gdrive or GoogleDriveResolver()).resolve(path)
+        if doc.markdown is not None:
+            return doc.markdown
+        return get_converter(engine, **options).convert_bytes(doc.data, filename=doc.filename)
     return get_converter(engine, **options).convert_file(path)
 
 

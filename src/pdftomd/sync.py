@@ -5,7 +5,8 @@ the destination directory, keyed by the POSIX relative path of each source
 file. A source file is (re)generated when any of the following holds:
 
 * it has no manifest entry,
-* its content hash differs from the recorded one,
+* its fingerprint differs from the recorded one (SHA-256 of the content for
+  local files, remote version for Google Drive stubs),
 * the recorded engine differs from the engine in use,
 * the destination Markdown file is missing,
 * it was explicitly selected / ``force`` was requested.
@@ -20,12 +21,16 @@ import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable
 
 from .converters.base import ConversionError, Converter
 
+if TYPE_CHECKING:  # pragma: no cover
+    from .gdrive import GoogleDriveResolver
+
 MANIFEST_NAME = ".pdftomd-manifest.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
+_GDRIVE_ENGINE = "gdrive"  # recorded when Drive exported Markdown directly (no engine involved)
 
 
 class Reason(str, Enum):
@@ -50,6 +55,7 @@ class SyncPlan:
     up_to_date: list[str] = field(default_factory=list)
     unsupported: list[str] = field(default_factory=list)
     orphans: list[Path] = field(default_factory=list)  # destination files without a source
+    errors: dict[str, str] = field(default_factory=dict)  # files whose state could not be determined
 
 
 @dataclass
@@ -61,12 +67,19 @@ class SyncResult:
 
 @dataclass
 class ManifestEntry:
-    sha256: str
+    fingerprint: str
     size: int
     mtime: float
     engine: str
     output: str
     generated_at: float
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ManifestEntry":
+        d = dict(d)
+        if "sha256" in d:  # manifest version 1
+            d["fingerprint"] = d.pop("sha256")
+        return cls(**d)
 
 
 def file_sha256(path: Path, chunk: int = 1 << 20) -> str:
@@ -88,7 +101,7 @@ class Manifest:
         self.entries: dict[str, ManifestEntry] = {}
         if path.exists():
             data = json.loads(path.read_text("utf-8"))
-            self.entries = {k: ManifestEntry(**v) for k, v in data.get("files", {}).items()}
+            self.entries = {k: ManifestEntry.from_dict(v) for k, v in data.get("files", {}).items()}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,6 +118,7 @@ class Syncer:
         dest_dir: str | Path,
         converter: Converter,
         *,
+        gdrive: "GoogleDriveResolver | None" = None,
         extensions: Iterable[str] | None = None,
         follow_symlinks: bool = False,
     ) -> None:
@@ -115,9 +129,16 @@ class Syncer:
         if self.dest_dir == self.source_dir or self.source_dir in self.dest_dir.parents:
             raise ValueError("Destination must not be the source directory or inside it.")
         self.converter = converter
-        self.extensions = frozenset(e.lower() for e in extensions) if extensions else converter.extensions
+        self.gdrive = gdrive
+        if extensions:
+            self.extensions = frozenset(e.lower() for e in extensions)
+        else:
+            self.extensions = converter.extensions | (gdrive.extensions if gdrive else frozenset())
         self.follow_symlinks = follow_symlinks
         self.manifest = Manifest(self.dest_dir / MANIFEST_NAME)
+
+    def _is_remote(self, path: Path) -> bool:
+        return self.gdrive is not None and path.suffix.lower() in self.gdrive.extensions
 
     # -- discovery -----------------------------------------------------------
 
@@ -147,6 +168,8 @@ class Syncer:
         selected = {self._rel(s) for s in select} if select else None
         plan = SyncPlan()
         seen_outputs: set[str] = set()
+        if self.gdrive is not None:
+            self.gdrive.clear_cache()  # fresh remote metadata for this run
 
         for rel, src in self.iter_source_files():
             if src.suffix.lower() not in self.extensions:
@@ -160,7 +183,11 @@ class Syncer:
                 if rel in selected:
                     plan.to_generate.append(PlannedItem(rel, src, dest, Reason.FORCED))
                 continue
-            reason = Reason.FORCED if force else self._staleness(rel, src, dest)
+            try:
+                reason = Reason.FORCED if force else self._staleness(rel, src, dest)
+            except (ConversionError, OSError) as exc:
+                plan.errors[rel] = str(exc)
+                continue
             if reason is None:
                 plan.up_to_date.append(rel)
             else:
@@ -183,6 +210,17 @@ class Syncer:
 
     def _staleness(self, rel: str, src: Path, dest: Path) -> Reason | None:
         entry = self.manifest.entries.get(rel)
+        if self._is_remote(src):
+            # Stub bytes never change; ask Drive for the remote version.
+            info = self.gdrive.describe(src)
+            if entry is None:
+                return Reason.NEW
+            if not dest.exists():
+                return Reason.OUTPUT_MISSING
+            expected_engine = self.converter.name if info.needs_engine else _GDRIVE_ENGINE
+            if entry.engine != expected_engine:
+                return Reason.ENGINE_CHANGED
+            return None if info.fingerprint == entry.fingerprint else Reason.CHANGED
         if entry is None:
             return Reason.NEW
         if not dest.exists():
@@ -193,11 +231,20 @@ class Syncer:
         # Cheap check first; only hash when size/mtime moved.
         if st.st_size == entry.size and st.st_mtime == entry.mtime:
             return None
-        if file_sha256(src) != entry.sha256:
+        if file_sha256(src) != entry.fingerprint:
             return Reason.CHANGED
         # Same content, only metadata changed: refresh the recorded metadata.
         entry.size, entry.mtime = st.st_size, st.st_mtime
         return None
+
+    def _produce(self, src: Path) -> tuple[str, str, str]:
+        """Return (markdown, fingerprint, engine) for a source file."""
+        if self._is_remote(src):
+            doc = self.gdrive.resolve(src)
+            if doc.markdown is not None:
+                return doc.markdown, doc.fingerprint, _GDRIVE_ENGINE
+            return self.converter.convert_bytes(doc.data, filename=doc.filename), doc.fingerprint, self.converter.name
+        return self.converter.convert_file(src), file_sha256(src), self.converter.name
 
     # -- execution -----------------------------------------------------------
 
@@ -210,6 +257,7 @@ class Syncer:
         on_error: Callable[[PlannedItem, Exception], None] | None = None,
     ) -> SyncResult:
         result = SyncResult()
+        result.failed.update(plan.errors)
         total = len(plan.to_generate)
         self.dest_dir.mkdir(parents=True, exist_ok=True)
         for index, item in enumerate(plan.to_generate, 1):
@@ -217,8 +265,7 @@ class Syncer:
                 on_progress(item, index, total)
             try:
                 st = item.source.stat()
-                sha = file_sha256(item.source)
-                markdown = self.converter.convert_file(item.source)
+                markdown, fingerprint, engine = self._produce(item.source)
             except (ConversionError, OSError) as exc:
                 result.failed[item.rel_path] = str(exc)
                 if on_error:
@@ -229,10 +276,10 @@ class Syncer:
             tmp.write_text(markdown, "utf-8")
             os.replace(tmp, item.destination)
             self.manifest.entries[item.rel_path] = ManifestEntry(
-                sha256=sha,
+                fingerprint=fingerprint,
                 size=st.st_size,
                 mtime=st.st_mtime,
-                engine=self.converter.name,
+                engine=engine,
                 output=item.destination.relative_to(self.dest_dir).as_posix(),
                 generated_at=time.time(),
             )

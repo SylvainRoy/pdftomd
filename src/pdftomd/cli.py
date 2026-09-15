@@ -13,10 +13,12 @@ from .converters.gemini import DEFAULT_MODEL
 from .sync import PlannedItem, Syncer, SyncPlan
 
 app = typer.Typer(
-    help="Convert documents (PDF, scans, ...) to Markdown. One-way, incremental, source is never modified.",
+    help="Convert documents (PDF, scans, Google Docs, ...) to Markdown. One-way, incremental, source is never modified.",
     no_args_is_help=True,
     add_completion=False,
 )
+gdrive_app = typer.Typer(help="Google Drive account setup (for .gdoc / .gsheet / .gslides stubs).", no_args_is_help=True)
+app.add_typer(gdrive_app, name="gdrive")
 
 Engine = typer.Option("marker", "--engine", "-e", help=f"Conversion backend: {', '.join(ENGINES)}.", case_sensitive=False)
 ForceOcr = typer.Option(False, "--force-ocr", help="(marker) Re-OCR every page (best for poor scans).")
@@ -24,6 +26,12 @@ UseLlm = typer.Option(False, "--use-llm", help="(marker) Hybrid LLM mode for bet
 Langs = typer.Option(None, "--lang", help="(marker) OCR language(s), e.g. --lang en --lang fr.")
 GeminiModel = typer.Option(DEFAULT_MODEL, "--gemini-model", help="(gemini) Model name.")
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
+GDrive = typer.Option(
+    None,
+    "--gdrive/--no-gdrive",
+    help="Fetch .gdoc/.gsheet/.gslides stubs from Google Drive. Default: on when logged in (`pdftomd gdrive login`).",
+    show_default=False,
+)
 
 
 def _converter(engine: str, force_ocr: bool, use_llm: bool, langs: Optional[list[str]], model: str, api_key: Optional[str]):
@@ -33,6 +41,19 @@ def _converter(engine: str, force_ocr: bool, use_llm: bool, langs: Optional[list
     if engine == "marker":
         return get_converter("marker", force_ocr=force_ocr, use_llm=use_llm, languages=langs or None)
     return get_converter("gemini", model=model, api_key=api_key)
+
+
+def _resolver(enabled: Optional[bool]):
+    from . import gdrive
+
+    if enabled is None:
+        enabled = gdrive.has_token()
+    if not enabled:
+        return None
+    if not gdrive.has_token():
+        typer.secho("Google Drive not configured; run `pdftomd gdrive login`.", fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+    return gdrive.GoogleDriveResolver()
 
 
 def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
@@ -45,9 +66,11 @@ def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
             typer.echo(f"[   unsupported] {rel}")
     for orphan in plan.orphans:
         typer.echo(f"[        orphan] {orphan}")
+    for rel, msg in plan.errors.items():
+        typer.secho(f"[         error] {rel}: {msg}", fg=typer.colors.RED)
     typer.echo(
         f"-- {len(plan.to_generate)} to generate, {len(plan.up_to_date)} up to date, "
-        f"{len(plan.unsupported)} unsupported, {len(plan.orphans)} orphan output(s)",
+        f"{len(plan.unsupported)} unsupported, {len(plan.orphans)} orphan output(s), {len(plan.errors)} error(s)",
         err=True,
     )
 
@@ -81,6 +104,7 @@ def sync(
     select: Optional[list[str]] = typer.Option(None, "--select", "-s", help="Regenerate only these source files (relative to SOURCE); implies force for them. Repeatable."),
     prune: bool = typer.Option(False, "--prune", help="Delete destination .md files whose source no longer exists."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
+    use_gdrive: Optional[bool] = GDrive,
     force_ocr: bool = ForceOcr,
     use_llm: bool = UseLlm,
     lang: Optional[list[str]] = Langs,
@@ -89,7 +113,7 @@ def sync(
 ) -> None:
     """Synchronise SOURCE into DEST, regenerating only stale Markdown files."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key)
-    syncer = Syncer(source, dest, conv)
+    syncer = Syncer(source, dest, conv, gdrive=_resolver(use_gdrive))
     try:
         plan = syncer.plan(force=force, select=select or None)
     except FileNotFoundError as exc:
@@ -97,7 +121,7 @@ def sync(
         raise typer.Exit(2)
     _print_plan(plan, verbose=verbose or dry_run)
     if dry_run:
-        raise typer.Exit()
+        raise typer.Exit(1 if plan.errors else 0)
     raise typer.Exit(_run(syncer, plan, prune))
 
 
@@ -107,10 +131,13 @@ def list_cmd(
     dest: Path = typer.Argument(...),
     engine: str = Engine,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
+    use_gdrive: Optional[bool] = GDrive,
 ) -> None:
     """List the documents that would be (re)generated, without converting anything."""
     conv = _converter(engine, False, False, None, DEFAULT_MODEL, None)
-    _print_plan(Syncer(source, dest, conv).plan(), verbose=verbose)
+    plan = Syncer(source, dest, conv, gdrive=_resolver(use_gdrive)).plan()
+    _print_plan(plan, verbose=verbose)
+    raise typer.Exit(1 if plan.errors else 0)
 
 
 @app.command()
@@ -124,10 +151,16 @@ def convert(
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
 ) -> None:
-    """Convert a single document and print the Markdown to stdout."""
+    """Convert a single document (or Google Drive stub) and print the Markdown to stdout."""
+    from .gdrive import GoogleDriveResolver, is_stub
+
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key)
     try:
-        markdown = conv.convert_file(file)
+        if is_stub(file):
+            doc = GoogleDriveResolver().resolve(file)
+            markdown = doc.markdown if doc.markdown is not None else conv.convert_bytes(doc.data, filename=doc.filename)
+        else:
+            markdown = conv.convert_file(file)
     except ConversionError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
@@ -145,6 +178,7 @@ def watch(
     engine: str = Engine,
     interval: float = typer.Option(10.0, "--interval", "-i", help="Seconds between scans of SOURCE."),
     prune: bool = typer.Option(False, "--prune", help="Delete destination .md files whose source disappeared."),
+    use_gdrive: Optional[bool] = GDrive,
     force_ocr: bool = ForceOcr,
     use_llm: bool = UseLlm,
     lang: Optional[list[str]] = Langs,
@@ -153,16 +187,57 @@ def watch(
 ) -> None:
     """Keep DEST in sync with SOURCE, re-scanning periodically until interrupted."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key)
-    syncer = Syncer(source, dest, conv)
+    syncer = Syncer(source, dest, conv, gdrive=_resolver(use_gdrive))
     typer.echo(f"watching {syncer.source_dir} every {interval:g}s (Ctrl-C to stop)", err=True)
     try:
         while True:
             plan = syncer.plan()
-            if plan.to_generate or (prune and plan.orphans):
+            if plan.to_generate or plan.errors or (prune and plan.orphans):
                 _run(syncer, plan, prune)
             time.sleep(interval)
     except KeyboardInterrupt:
         typer.echo("stopped", err=True)
+
+
+@gdrive_app.command("login")
+def gdrive_login(
+    client_secret: Optional[Path] = typer.Option(None, "--client-secret", help="OAuth 'Desktop app' client JSON downloaded from Google Cloud console."),
+) -> None:
+    """Authorise read-only access to your Google Drive (opens a browser once)."""
+    from . import gdrive
+
+    try:
+        path = gdrive.login(client_secret)
+    except ConversionError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Logged in. Token saved to {path}")
+
+
+@gdrive_app.command("status")
+def gdrive_status() -> None:
+    """Show whether Google Drive access is configured and working."""
+    from . import gdrive
+
+    typer.echo(f"config dir:    {gdrive.config_dir()}")
+    typer.echo(f"client secret: {'present' if gdrive.client_secret_path().exists() else 'missing'} ({gdrive.client_secret_path()})")
+    typer.echo(f"token:         {'present' if gdrive.has_token() else 'missing'} ({gdrive.token_path()})")
+    if gdrive.has_token():
+        try:
+            gdrive.load_credentials()
+            typer.echo("credentials:   valid")
+        except ConversionError as exc:
+            typer.secho(f"credentials:   {exc}", fg=typer.colors.RED)
+            raise typer.Exit(1)
+
+
+@gdrive_app.command("logout")
+def gdrive_logout() -> None:
+    """Forget the cached Google Drive token."""
+    from . import gdrive
+
+    gdrive.token_path().unlink(missing_ok=True)
+    typer.echo("Token removed.")
 
 
 if __name__ == "__main__":  # pragma: no cover
