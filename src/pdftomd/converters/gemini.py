@@ -7,7 +7,7 @@ import time
 
 from .base import ConversionError, Converter, guess_mime
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.6-flash"
 INLINE_LIMIT_BYTES = 19 * 1024 * 1024  # Gemini inline request limit is ~20MB
 
 SYSTEM_PROMPT = """\
@@ -38,7 +38,7 @@ CONTINUE_PROMPT = (
 
 
 class GeminiConverter(Converter):
-    """Conversion through the Google Gemini API (default: Gemini 1.5 Flash).
+    """Conversion through the Google Gemini API (default: Gemini 3.6 Flash).
 
     The whole document is sent in a single request so that Gemini sees
     multi-page tables in context. Documents above the inline size limit are
