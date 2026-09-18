@@ -36,6 +36,23 @@ def tree(tmp_path: Path):
     return src, tmp_path / "dst"
 
 
+@pytest.fixture
+def extree(tmp_path: Path):
+    src = tmp_path / "src"
+    for d in ("old", "sub/old", "older", "old_stuff", "sub", "x.pdf"):
+        (src / d).mkdir(parents=True, exist_ok=True)
+    (src / "old" / "a.pdf").write_bytes(b"a")
+    (src / "sub" / "old" / "b.pdf").write_bytes(b"b")
+    (src / "older" / "c.pdf").write_bytes(b"c")
+    (src / "older" / "old").write_bytes(b"old-file")
+    (src / "old_stuff" / "d.pdf").write_bytes(b"d")
+    (src / "sub" / "x.tmp").write_bytes(b"tmp")
+    (src / "sub" / "e.pdf").write_bytes(b"e")
+    (src / "x.pdf" / "f.pdf").write_bytes(b"f")
+    (src / "top.pdf").write_bytes(b"top")
+    return src, tmp_path / "dst"
+
+
 def snapshot(path: Path) -> dict[str, bytes]:
     return {p.relative_to(path).as_posix(): p.read_bytes() for p in path.rglob("*") if p.is_file()}
 
@@ -152,6 +169,82 @@ def test_orphans_and_prune(tree):
     assert result.pruned == ["root.md"]
     assert not (dst / "root.md").exists()
     assert "root.pdf" not in json.loads((dst / MANIFEST_NAME).read_text())["files"]
+
+
+def test_exclude_name_matches_dirs_and_files(extree):
+    src, dst = extree
+    plan = Syncer(src, dst, FakeConverter(), exclude_name=["old"]).plan()
+    generated = {i.rel_path for i in plan.to_generate}
+    assert generated == {"older/c.pdf", "old_stuff/d.pdf", "sub/e.pdf", "top.pdf", "x.pdf/f.pdf"}
+    assert plan.excluded == ["old/", "older/old", "sub/old/"]
+
+
+def test_exclude_name_regex(extree):
+    src, dst = extree
+    plan = Syncer(src, dst, FakeConverter(), exclude_name=[r".*\.tmp"]).plan()
+    assert "sub/x.tmp" not in {i.rel_path for i in plan.to_generate}
+    assert "sub/x.tmp" not in plan.unsupported
+    assert plan.excluded == ["sub/x.tmp"]
+
+
+def test_exclude_path(extree):
+    src, dst = extree
+    plan = Syncer(src, dst, FakeConverter(), exclude_path=[r"^sub/old/"]).plan()
+    generated = {i.rel_path for i in plan.to_generate}
+    assert "sub/old/b.pdf" not in generated
+    assert "old/a.pdf" in generated and "sub/e.pdf" in generated
+    assert plan.excluded == ["sub/old/"]
+
+    plan = Syncer(src, dst, FakeConverter(), exclude_path=[r"/$"]).plan()
+    assert {i.rel_path for i in plan.to_generate} == {"top.pdf"}
+    assert plan.excluded == ["old/", "old_stuff/", "older/", "sub/", "x.pdf/"]
+
+
+def test_exclude_path_matches_files_but_dirs_still_get_trailing_slash(extree):
+    src, dst = extree
+    plan = Syncer(src, dst, FakeConverter(), exclude_path=[r"\.pdf$"]).plan()
+    assert plan.to_generate == []
+    assert "x.pdf/" not in plan.excluded  # dir target is "x.pdf/", still descended
+    assert "x.pdf/f.pdf" in plan.excluded
+    assert plan.excluded == [
+        "top.pdf",
+        "old/a.pdf",
+        "old_stuff/d.pdf",
+        "older/c.pdf",
+        "sub/e.pdf",
+        "sub/old/b.pdf",
+        "x.pdf/f.pdf",
+    ]
+
+
+def test_newly_excluded_sources_become_orphans(extree):
+    src, dst = extree
+    conv = FakeConverter()
+    Syncer(src, dst, conv).sync()
+    assert (dst / "old" / "a.md").exists() and (dst / "sub" / "old" / "b.md").exists()
+
+    syncer = Syncer(src, dst, conv, exclude_name=["old"])
+    plan = syncer.plan()
+    assert sorted(p.relative_to(dst).as_posix() for p in plan.orphans) == ["old/a.md", "sub/old/b.md"]
+    assert (dst / "old" / "a.md").exists()  # plan alone never deletes
+
+    result = syncer.execute(plan, prune=True)
+    assert sorted(result.pruned) == ["old/a.md", "sub/old/b.md"]
+    assert not (dst / "old" / "a.md").exists() and not (dst / "sub" / "old" / "b.md").exists()
+    entries = json.loads((dst / MANIFEST_NAME).read_text())["files"]
+    assert "old/a.pdf" not in entries and "sub/old/b.pdf" not in entries
+
+
+def test_select_does_not_override_exclusion(extree):
+    src, dst = extree
+    with pytest.raises(FileNotFoundError, match="excluded"):
+        Syncer(src, dst, FakeConverter(), exclude_name=["old"]).plan(select=["old/a.pdf"])
+
+
+def test_invalid_exclude_pattern_rejected(extree):
+    src, dst = extree
+    with pytest.raises(ValueError, match=r"Invalid exclude pattern '\('"):
+        Syncer(src, dst, FakeConverter(), exclude_name=["("])
 
 
 def test_dest_inside_source_rejected(tree):

@@ -59,6 +59,31 @@ hash changed, the engine changed, its `.md` is missing, or it was selected /
 forced. A touched-but-identical file is *not* regenerated. Destination files
 whose source vanished are reported as orphans and only deleted with `--prune`.
 
+## Excluding files and directories
+
+`sync`, `list` and `watch` accept two repeatable exclusion flags that apply to
+both files and directories at any depth:
+
+| flag            | tested against                                             | rule                                   | examples                              |
+|-----------------|------------------------------------------------------------|----------------------------------------|---------------------------------------|
+| `--exclude-name` / `-x` | the bare name of a file or directory            | `re.fullmatch` on the name             | `old`, `.*\.tmp`, `(?i)draft.*`        |
+| `--exclude-path` / `-X` | the POSIX path relative to the source directory | `re.search` on the path; directories end with `/` | `^reports/2023/`, `/archive/$`, `\.png$` |
+
+```bash
+pdftomd sync ./docs ./docs-md -x old -x '.*\.tmp'
+pdftomd sync ./docs ./docs-md --exclude-path '^reports/2023/' --exclude-path '\.png$'
+```
+
+Notes:
+
+* an excluded directory is not descended into — everything under it is skipped;
+* excluded entries are listed in the plan output with `-v` / `--dry-run`;
+* hidden entries (names starting with `.`) are always skipped, patterns or not;
+* an output whose source is now excluded becomes an orphan — it is deleted only
+  with `--prune`;
+* `--select` does not override exclusion: selecting an excluded file is an error;
+* use `(?i)` inside a pattern for case-insensitive matching.
+
 ## Google Drive documents
 
 Google Drive for Desktop stores native documents as 170-byte JSON stubs
@@ -107,7 +132,8 @@ md = convert_bytes(pdf_bytes, filename="report.pdf", engine="gemini")
 md = convert_file("report.pdf", engine="marker", force_ocr=True)
 
 # Directory level.
-syncer = Syncer("docs", "docs-md", get_converter("marker", force_ocr=True))
+syncer = Syncer("docs", "docs-md", get_converter("marker", force_ocr=True),
+                exclude_name=["old"], exclude_path=[r"^reports/2023/"])
 plan = syncer.plan()                          # dry run, pure
 for item in plan.to_generate:
     print(item.reason.value, item.rel_path)

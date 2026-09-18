@@ -10,6 +10,10 @@ file. A source file is (re)generated when any of the following holds:
 * the recorded engine differs from the engine in use,
 * the destination Markdown file is missing,
 * it was explicitly selected / ``force`` was requested.
+
+Files and directories can be excluded from the walk with ``exclude_name``
+(bare-name regex) and ``exclude_path`` (source-relative path regex); hidden
+entries are always skipped.
 """
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
@@ -54,6 +59,7 @@ class SyncPlan:
     to_generate: list[PlannedItem] = field(default_factory=list)
     up_to_date: list[str] = field(default_factory=list)
     unsupported: list[str] = field(default_factory=list)
+    excluded: list[str] = field(default_factory=list)  # source files/dirs skipped by exclude patterns
     orphans: list[Path] = field(default_factory=list)  # destination files without a source
     errors: dict[str, str] = field(default_factory=dict)  # files whose state could not be determined
 
@@ -95,6 +101,16 @@ def markdown_path_for(rel_path: str) -> str:
     return str(PurePosixPath(rel_path).with_suffix(".md"))
 
 
+def _compile(patterns: Iterable[str] | None) -> list[re.Pattern]:
+    out = []
+    for p in patterns or ():
+        try:
+            out.append(re.compile(p))
+        except re.error as err:
+            raise ValueError(f"Invalid exclude pattern {p!r}: {err}") from err
+    return out
+
+
 class Manifest:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -121,6 +137,8 @@ class Syncer:
         gdrive: "GoogleDriveResolver | None" = None,
         extensions: Iterable[str] | None = None,
         follow_symlinks: bool = False,
+        exclude_name: Iterable[str] | None = None,
+        exclude_path: Iterable[str] | None = None,
     ) -> None:
         self.source_dir = Path(source_dir).resolve()
         self.dest_dir = Path(dest_dir).resolve()
@@ -135,21 +153,40 @@ class Syncer:
         else:
             self.extensions = converter.extensions | (gdrive.extensions if gdrive else frozenset())
         self.follow_symlinks = follow_symlinks
+        self.exclude_name = _compile(exclude_name)
+        self.exclude_path = _compile(exclude_path)
         self.manifest = Manifest(self.dest_dir / MANIFEST_NAME)
+
+    def _excluded(self, name: str, rel: str, is_dir: bool) -> bool:
+        target = rel + "/" if is_dir else rel
+        return any(p.fullmatch(name) for p in self.exclude_name) or any(p.search(target) for p in self.exclude_path)
 
     def _is_remote(self, path: Path) -> bool:
         return self.gdrive is not None and path.suffix.lower() in self.gdrive.extensions
 
     # -- discovery -----------------------------------------------------------
 
-    def iter_source_files(self) -> Iterable[tuple[str, Path]]:
+    def iter_source_files(self, *, excluded: list[str] | None = None) -> Iterable[tuple[str, Path]]:
         for root, dirs, files in os.walk(self.source_dir, followlinks=self.follow_symlinks):
-            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            kept = []
+            for d in sorted(d for d in dirs if not d.startswith(".")):
+                rel = (Path(root) / d).relative_to(self.source_dir).as_posix()
+                if self._excluded(d, rel, True):
+                    if excluded is not None:
+                        excluded.append(rel + "/")
+                else:
+                    kept.append(d)
+            dirs[:] = kept
             for name in sorted(files):
                 if name.startswith("."):
                     continue
                 path = Path(root) / name
-                yield path.relative_to(self.source_dir).as_posix(), path
+                rel = path.relative_to(self.source_dir).as_posix()
+                if self._excluded(name, rel, False):
+                    if excluded is not None:
+                        excluded.append(rel)
+                    continue
+                yield rel, path
 
     def _rel(self, selection: str | Path) -> str:
         p = Path(selection)
@@ -171,7 +208,7 @@ class Syncer:
         if self.gdrive is not None:
             self.gdrive.clear_cache()  # fresh remote metadata for this run
 
-        for rel, src in self.iter_source_files():
+        for rel, src in self.iter_source_files(excluded=plan.excluded):
             if src.suffix.lower() not in self.extensions:
                 if selected is None or rel in selected:
                     plan.unsupported.append(rel)
@@ -196,6 +233,9 @@ class Syncer:
         if selected is not None:
             missing = selected - {i.rel_path for i in plan.to_generate} - set(plan.unsupported)
             if missing:
+                for rel in sorted(missing):
+                    if self._selection_excluded(rel):
+                        raise FileNotFoundError(f"{rel} is excluded by an exclude pattern")
                 raise FileNotFoundError(f"Selected files not found in source: {sorted(missing)}")
 
         if self.dest_dir.is_dir():
@@ -207,6 +247,17 @@ class Syncer:
                     if p.suffix.lower() == ".md" and rel_out not in seen_outputs:
                         plan.orphans.append(p)
         return plan
+
+    def _selection_excluded(self, rel: str) -> bool:
+        """True if ``rel`` (a selected path missing from the walk) is excluded by a pattern."""
+        if self._excluded(Path(rel).name, rel, False):
+            return True
+        parts = PurePosixPath(rel).parts[:-1]
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i])
+            if self._excluded(parts[i - 1], prefix, True):
+                return True
+        return False
 
     def _staleness(self, rel: str, src: Path, dest: Path) -> Reason | None:
         entry = self.manifest.entries.get(rel)

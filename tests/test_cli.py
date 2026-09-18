@@ -54,6 +54,25 @@ def test_sync_then_list_then_select(tree, fake_engine):
     assert res.exit_code == 2
 
 
+def test_exclude_flags(tree, fake_engine):
+    src, dst = tree
+    (src / "old").mkdir()
+    (src / "old" / "c.pdf").write_bytes(b"c")
+    (src / "sub" / "x.pdf").write_bytes(b"x")
+    res = runner.invoke(cli.app, ["sync", str(src), str(dst), "--dry-run", "-v", "-x", "old", "-X", "^sub/x"])
+    assert res.exit_code == 0, res.output
+    assert "[      excluded] old/" in res.output
+    assert "[      excluded] sub/x.pdf" in res.output
+    assert "excluded" in res.output
+
+
+def test_invalid_exclude_pattern_exits_2(tree, fake_engine):
+    src, dst = tree
+    res = runner.invoke(cli.app, ["sync", str(src), str(dst), "-x", "("])
+    assert res.exit_code == 2
+    assert "Invalid exclude pattern" in res.output
+
+
 def test_convert_single_file_to_stdout(tree, fake_engine):
     src, _ = tree
     res = runner.invoke(cli.app, ["convert", str(src / "a.pdf")])

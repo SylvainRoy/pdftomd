@@ -26,6 +26,8 @@ UseLlm = typer.Option(False, "--use-llm", help="(marker) Hybrid LLM mode for bet
 Langs = typer.Option(None, "--lang", help="(marker) OCR language(s), e.g. --lang en --lang fr.")
 GeminiModel = typer.Option(DEFAULT_MODEL, "--gemini-model", help="(gemini) Model name.")
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
+ExcludeName = typer.Option(None, "--exclude-name", "-x", help="Skip files/directories whose name fully matches this regex (any depth). Repeatable.")
+ExcludePath = typer.Option(None, "--exclude-path", "-X", help="Skip files/directories whose source-relative path matches this regex (directories end with '/'). Repeatable.")
 GDrive = typer.Option(
     None,
     "--gdrive/--no-gdrive",
@@ -56,6 +58,14 @@ def _resolver(enabled: Optional[bool]):
     return gdrive.GoogleDriveResolver()
 
 
+def _syncer(source: Path, dest: Path, conv, gdrive, exclude_name: Optional[list[str]], exclude_path: Optional[list[str]]) -> Syncer:
+    try:
+        return Syncer(source, dest, conv, gdrive=gdrive, exclude_name=exclude_name, exclude_path=exclude_path)
+    except ValueError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(2)
+
+
 def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
     for item in plan.to_generate:
         typer.echo(f"[{item.reason.value:>14}] {item.rel_path}")
@@ -64,13 +74,16 @@ def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
             typer.echo(f"[    up-to-date] {rel}")
         for rel in plan.unsupported:
             typer.echo(f"[   unsupported] {rel}")
+        for rel in plan.excluded:
+            typer.echo(f"[      excluded] {rel}")
     for orphan in plan.orphans:
         typer.echo(f"[        orphan] {orphan}")
     for rel, msg in plan.errors.items():
         typer.secho(f"[         error] {rel}: {msg}", fg=typer.colors.RED)
     typer.echo(
         f"-- {len(plan.to_generate)} to generate, {len(plan.up_to_date)} up to date, "
-        f"{len(plan.unsupported)} unsupported, {len(plan.orphans)} orphan output(s), {len(plan.errors)} error(s)",
+        f"{len(plan.unsupported)} unsupported, {len(plan.excluded)} excluded, "
+        f"{len(plan.orphans)} orphan output(s), {len(plan.errors)} error(s)",
         err=True,
     )
 
@@ -103,6 +116,8 @@ def sync(
     force: bool = typer.Option(False, "--force", "-f", help="Regenerate everything even if up to date."),
     select: Optional[list[str]] = typer.Option(None, "--select", "-s", help="Regenerate only these source files (relative to SOURCE); implies force for them. Repeatable."),
     prune: bool = typer.Option(False, "--prune", help="Delete destination .md files whose source no longer exists."),
+    exclude_name: Optional[list[str]] = ExcludeName,
+    exclude_path: Optional[list[str]] = ExcludePath,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
     use_gdrive: Optional[bool] = GDrive,
     force_ocr: bool = ForceOcr,
@@ -113,7 +128,7 @@ def sync(
 ) -> None:
     """Synchronise SOURCE into DEST, regenerating only stale Markdown files."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key)
-    syncer = Syncer(source, dest, conv, gdrive=_resolver(use_gdrive))
+    syncer = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path)
     try:
         plan = syncer.plan(force=force, select=select or None)
     except FileNotFoundError as exc:
@@ -130,12 +145,14 @@ def list_cmd(
     source: Path = typer.Argument(..., exists=True, file_okay=False, readable=True),
     dest: Path = typer.Argument(...),
     engine: str = Engine,
+    exclude_name: Optional[list[str]] = ExcludeName,
+    exclude_path: Optional[list[str]] = ExcludePath,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
     use_gdrive: Optional[bool] = GDrive,
 ) -> None:
     """List the documents that would be (re)generated, without converting anything."""
     conv = _converter(engine, False, False, None, DEFAULT_MODEL, None)
-    plan = Syncer(source, dest, conv, gdrive=_resolver(use_gdrive)).plan()
+    plan = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path).plan()
     _print_plan(plan, verbose=verbose)
     raise typer.Exit(1 if plan.errors else 0)
 
@@ -178,6 +195,8 @@ def watch(
     engine: str = Engine,
     interval: float = typer.Option(10.0, "--interval", "-i", help="Seconds between scans of SOURCE."),
     prune: bool = typer.Option(False, "--prune", help="Delete destination .md files whose source disappeared."),
+    exclude_name: Optional[list[str]] = ExcludeName,
+    exclude_path: Optional[list[str]] = ExcludePath,
     use_gdrive: Optional[bool] = GDrive,
     force_ocr: bool = ForceOcr,
     use_llm: bool = UseLlm,
@@ -187,7 +206,7 @@ def watch(
 ) -> None:
     """Keep DEST in sync with SOURCE, re-scanning periodically until interrupted."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key)
-    syncer = Syncer(source, dest, conv, gdrive=_resolver(use_gdrive))
+    syncer = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path)
     typer.echo(f"watching {syncer.source_dir} every {interval:g}s (Ctrl-C to stop)", err=True)
     try:
         while True:
