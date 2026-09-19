@@ -27,6 +27,35 @@ uv sync --extra all
 
 Requires Python 3.10-3.13 (marker's PyTorch dependency does not support 3.14 yet).
 
+## Credentials
+
+pdftomd can talk to **two different Google services**, each with its own
+credential — they are not interchangeable:
+
+| for | what it is | where to get it | where pdftomd reads it |
+|-----|------------|-----------------|------------------------|
+| `gemini` engine (and marker's `--use-llm`) | a Gemini **API key** (`AIza...`) | [Google AI Studio → API keys](https://aistudio.google.com/apikey) | `GEMINI_API_KEY` env var (also accepts `GOOGLE_API_KEY`), or `--gemini-api-key` |
+| `.gdoc` / `.gsheet` / `.gslides` stubs | a Google Drive **OAuth token** (not an API key) | see [Google Drive documents](#google-drive-documents) | `pdftomd gdrive login`, token in `~/.config/pdftomd/` |
+
+### Gemini API key
+
+1. Open [Google AI Studio](https://aistudio.google.com/apikey) and click
+   **Create API key** (it is attached to a Google Cloud project).
+2. Make it available to pdftomd:
+   ```bash
+   export GEMINI_API_KEY="AIza..."          # e.g. in ~/.zshrc
+   # or per-command:
+   pdftomd convert scan.pdf --engine gemini --gemini-api-key "AIza..."
+   ```
+3. **Free tier vs paid**: new projects start on the free tier, with low rate
+   limits and documents *used to improve Google products*. For higher limits
+   and the privacy guarantee, open AI Studio → **API keys**/**Projects**,
+   click **Set up billing** for the project and link a Cloud Billing account
+   (prepay, min ~$5). Tier 1 applies immediately; a **Spend Cap** can be set
+   in AI Studio to bound monthly cost. (The *Google AI Pro/Ultra*
+   subscriptions only raise limits inside the AI Studio playground — they do
+   **not** apply to API keys.)
+
 ## CLI
 
 ```bash
@@ -88,7 +117,9 @@ Notes:
 
 Google Drive for Desktop stores native documents as 170-byte JSON stubs
 containing only a `doc_id`. pdftomd resolves them through the Drive API
-(read-only scope) when logged in:
+(read-only scope) when logged in. This uses an **OAuth token**, which is a
+different credential from the Gemini API key — see
+[Credentials](#credentials):
 
 | stub        | how it becomes Markdown                                            | manifest engine |
 |-------------|--------------------------------------------------------------------|-----------------|
