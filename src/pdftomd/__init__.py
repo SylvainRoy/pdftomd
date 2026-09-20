@@ -29,7 +29,7 @@ from .sync import (
     markdown_path_for,
 )
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 
 def convert_bytes(data: bytes, *, filename: str, engine: str = "marker", **options: Any) -> str:

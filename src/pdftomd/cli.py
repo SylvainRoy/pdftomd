@@ -15,6 +15,7 @@ from .sync import PlannedItem, Syncer, SyncPlan
 app = typer.Typer(
     help="Convert documents (PDF, scans, Google Docs, ...) to Markdown. One-way, incremental, source is never modified.",
     no_args_is_help=True,
+    invoke_without_command=True,
     add_completion=False,
 )
 gdrive_app = typer.Typer(help="Google Drive account setup (for .gdoc / .gsheet / .gslides stubs).", no_args_is_help=True)
@@ -102,9 +103,12 @@ def _run(syncer: Syncer, plan: SyncPlan, prune: bool) -> int:
 
 
 @app.callback()
-def _main(version: bool = typer.Option(False, "--version", is_eager=True)) -> None:
+def _main(ctx: typer.Context, version: bool = typer.Option(False, "--version", is_eager=True)) -> None:
     if version:
         typer.echo(f"pdftomd {__version__}")
+        raise typer.Exit()
+    if ctx.invoked_subcommand is None:
+        typer.echo(ctx.get_help())
         raise typer.Exit()
 
 
