@@ -56,24 +56,32 @@ class GeminiConverter(Converter):
         model: str = DEFAULT_MODEL,
         max_continuations: int = 30,
         retries: int = 3,
+        request_timeout: float = 300.0,
     ) -> None:
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         self.model = model
         self.max_continuations = max_continuations
         self.retries = retries
+        self.request_timeout = request_timeout
         self._client = None
 
     def _get_client(self):
         if self._client is None:
             try:
                 from google import genai
+                from google.genai import types
             except ImportError as exc:  # pragma: no cover - depends on env
                 raise ConversionError(
                     "google-genai is not installed. Install with `pip install 'pdftomd[gemini]'`."
                 ) from exc
             if not self.api_key:
                 raise ConversionError("No Gemini API key: set GEMINI_API_KEY or pass api_key=.")
-            self._client = genai.Client(api_key=self.api_key)
+            # A real timeout on every request: a stalled connection (e.g. a proxy
+            # silently dropping the stream) would otherwise hang the sync forever.
+            self._client = genai.Client(
+                api_key=self.api_key,
+                http_options=types.HttpOptions(timeout=int(self.request_timeout * 1000)),
+            )
         return self._client
 
     def convert_bytes(self, data: bytes, *, filename: str) -> str:
@@ -86,10 +94,7 @@ class GeminiConverter(Converter):
             if len(data) <= INLINE_LIMIT_BYTES:
                 doc_part = types.Part.from_bytes(data=data, mime_type=mime)
             else:
-                uploaded = client.files.upload(file=io.BytesIO(data), config={"mime_type": mime})
-                while getattr(uploaded.state, "name", uploaded.state) == "PROCESSING":
-                    time.sleep(2)
-                    uploaded = client.files.get(name=uploaded.name)
+                uploaded = self._upload(client, data, mime)
                 doc_part = types.Part.from_uri(file_uri=uploaded.uri, mime_type=mime)
             return self._transcribe(client, types, doc_part)
         finally:
@@ -117,6 +122,32 @@ class GeminiConverter(Converter):
         else:
             raise ConversionError("Gemini output was still truncated after the maximum number of continuations.")
         return _strip_outer_fence("".join(chunks)).strip() + "\n"
+
+    def _upload(self, client, data: bytes, mime: str):
+        last: Exception | None = None
+        uploaded = None
+        for attempt in range(self.retries):
+            try:
+                uploaded = client.files.upload(file=io.BytesIO(data), config={"mime_type": mime})
+                break
+            except Exception as exc:  # transient upload errors / stalls
+                last = exc
+                time.sleep(2 ** attempt)
+        if uploaded is None:
+            raise ConversionError(f"Gemini file upload failed after {self.retries} attempts: {last}") from last
+        deadline = time.monotonic() + self.request_timeout
+        while getattr(uploaded.state, "name", uploaded.state) == "PROCESSING":
+            if time.monotonic() > deadline:
+                try:
+                    client.files.delete(name=uploaded.name)
+                except Exception:
+                    pass
+                raise ConversionError(f"Gemini file {uploaded.name} stayed in PROCESSING for over {self.request_timeout:g}s.")
+            time.sleep(2)
+            uploaded = client.files.get(name=uploaded.name)
+        if getattr(uploaded.state, "name", uploaded.state) != "ACTIVE":
+            raise ConversionError(f"Gemini file upload ended in state {uploaded.state!r}.")
+        return uploaded
 
     def _generate(self, client, contents, config):
         last: Exception | None = None

@@ -188,7 +188,9 @@ implement `convert_bytes(data, *, filename) -> str`.
 * **gemini**: the whole document is sent in one request with a strict
   transcription prompt (merge multi-page tables, mark `[illegible]` rather than
   guess, temperature 0). Files over ~20 MB go through the Files API; output
-  truncated at the token limit is continued automatically.
+  truncated at the token limit is continued automatically. Every API call has a
+  300 s timeout (`--gemini-timeout`) and is retried, so a stalled connection
+  cannot hang the sync.
 
 ## Troubleshooting
 

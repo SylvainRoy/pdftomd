@@ -26,6 +26,7 @@ UseLlm = typer.Option(False, "--use-llm", help="(marker) Hybrid LLM mode for bet
 Langs = typer.Option(None, "--lang", help="(marker) OCR language(s), e.g. --lang en --lang fr.")
 GeminiModel = typer.Option(DEFAULT_MODEL, "--gemini-model", help="(gemini) Model name.")
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
+GeminiTimeout = typer.Option(300.0, "--gemini-timeout", help="(gemini) Per-request timeout in seconds; stalled requests are retried.")
 ExcludeName = typer.Option(None, "--exclude-name", "-x", help="Skip files/directories whose name fully matches this regex (any depth). Repeatable.")
 ExcludePath = typer.Option(None, "--exclude-path", "-X", help="Skip files/directories whose source-relative path matches this regex (directories end with '/'). Repeatable.")
 GDrive = typer.Option(
@@ -36,13 +37,13 @@ GDrive = typer.Option(
 )
 
 
-def _converter(engine: str, force_ocr: bool, use_llm: bool, langs: Optional[list[str]], model: str, api_key: Optional[str]):
+def _converter(engine: str, force_ocr: bool, use_llm: bool, langs: Optional[list[str]], model: str, api_key: Optional[str], timeout: float = 300.0):
     engine = engine.lower()
     if engine not in ENGINES:
         raise typer.BadParameter(f"engine must be one of {ENGINES}")
     if engine == "marker":
         return get_converter("marker", force_ocr=force_ocr, use_llm=use_llm, languages=langs or None)
-    return get_converter("gemini", model=model, api_key=api_key)
+    return get_converter("gemini", model=model, api_key=api_key, request_timeout=timeout)
 
 
 def _resolver(enabled: Optional[bool]):
@@ -125,9 +126,10 @@ def sync(
     lang: Optional[list[str]] = Langs,
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
+    gemini_timeout: float = GeminiTimeout,
 ) -> None:
     """Synchronise SOURCE into DEST, regenerating only stale Markdown files."""
-    conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key)
+    conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
     syncer = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path)
     try:
         plan = syncer.plan(force=force, select=select or None)
@@ -167,11 +169,12 @@ def convert(
     lang: Optional[list[str]] = Langs,
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
+    gemini_timeout: float = GeminiTimeout,
 ) -> None:
     """Convert a single document (or Google Drive stub) and print the Markdown to stdout."""
     from .gdrive import GoogleDriveResolver, is_stub
 
-    conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key)
+    conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
     try:
         if is_stub(file):
             doc = GoogleDriveResolver().resolve(file)
@@ -203,9 +206,10 @@ def watch(
     lang: Optional[list[str]] = Langs,
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
+    gemini_timeout: float = GeminiTimeout,
 ) -> None:
     """Keep DEST in sync with SOURCE, re-scanning periodically until interrupted."""
-    conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key)
+    conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
     syncer = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path)
     typer.echo(f"watching {syncer.source_dir} every {interval:g}s (Ctrl-C to stop)", err=True)
     try:
