@@ -90,13 +90,13 @@ def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
 
 
 def _run(syncer: Syncer, plan: SyncPlan, prune: bool) -> int:
-    def progress(item: PlannedItem, i: int, n: int) -> None:
-        typer.echo(f"[{i}/{n}] {item.rel_path} ({item.reason.value})", err=True)
+    def done(item: PlannedItem, i: int, n: int, elapsed: float) -> None:
+        typer.echo(f"[{i}/{n}] {item.rel_path} ({item.reason.value}) — {elapsed:.1f}s", err=True)
 
     def error(item: PlannedItem, exc: Exception) -> None:
         typer.secho(f"  FAILED {item.rel_path}: {exc}", fg=typer.colors.RED, err=True)
 
-    result = syncer.execute(plan, prune=prune, on_progress=progress, on_error=error)
+    result = syncer.execute(plan, prune=prune, on_done=done, on_error=error)
     typer.echo(f"-- generated {len(result.generated)}, failed {len(result.failed)}, pruned {len(result.pruned)}", err=True)
     return 1 if result.failed else 0
 
@@ -175,6 +175,7 @@ def convert(
     from .gdrive import GoogleDriveResolver, is_stub
 
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
+    started = time.monotonic()
     try:
         if is_stub(file):
             doc = GoogleDriveResolver().resolve(file)
@@ -184,6 +185,7 @@ def convert(
     except ConversionError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
+    typer.echo(f"-- {file.name} converted in {time.monotonic() - started:.1f}s", err=True)
     if output:
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(markdown, "utf-8")

@@ -77,4 +77,4 @@ def test_convert_single_file_to_stdout(tree, fake_engine):
     src, _ = tree
     res = runner.invoke(cli.app, ["convert", str(src / "a.pdf")])
     assert res.exit_code == 0
-    assert res.output.startswith("# a.pdf")
+    assert "# a.pdf" in res.output  # stderr (timing line) is mixed into output by CliRunner

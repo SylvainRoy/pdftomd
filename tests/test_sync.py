@@ -247,6 +247,20 @@ def test_invalid_exclude_pattern_rejected(extree):
         Syncer(src, dst, FakeConverter(), exclude_name=["("])
 
 
+def test_on_done_reports_elapsed_per_file(tree):
+    src, dst = tree
+    calls = []
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.execute(
+        syncer.plan(),
+        on_done=lambda item, i, n, elapsed: calls.append((item.rel_path, i, n, elapsed)),
+    )
+    assert [c[0] for c in calls] == ["root.pdf", "a/one.pdf", "a/b/two.png"]
+    assert all(c[2] == 3 for c in calls)
+    assert [c[1] for c in calls] == [1, 2, 3]
+    assert all(c[3] >= 0 for c in calls)
+
+
 def test_dest_inside_source_rejected(tree):
     src, _ = tree
     with pytest.raises(ValueError):

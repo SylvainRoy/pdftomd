@@ -305,6 +305,7 @@ class Syncer:
         *,
         prune: bool = False,
         on_progress: Callable[[PlannedItem, int, int], None] | None = None,
+        on_done: Callable[[PlannedItem, int, int, float], None] | None = None,
         on_error: Callable[[PlannedItem, Exception], None] | None = None,
     ) -> SyncResult:
         result = SyncResult()
@@ -314,6 +315,7 @@ class Syncer:
         for index, item in enumerate(plan.to_generate, 1):
             if on_progress:
                 on_progress(item, index, total)
+            started = time.monotonic()
             try:
                 st = item.source.stat()
                 markdown, fingerprint, engine = self._produce(item.source)
@@ -336,6 +338,8 @@ class Syncer:
             )
             result.generated.append(item.rel_path)
             self.manifest.save()  # persist after each file so a crash loses nothing
+            if on_done:
+                on_done(item, index, total, time.monotonic() - started)
 
         if prune:
             for orphan in plan.orphans:
