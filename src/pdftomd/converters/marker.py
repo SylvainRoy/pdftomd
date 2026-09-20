@@ -15,6 +15,7 @@ class MarkerConverter(Converter):
     """
 
     name = "marker"
+    parallel_safe = False  # shared PyTorch models, lazily initialised
     extensions = frozenset(
         {".pdf", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
          ".docx", ".pptx", ".xlsx", ".html", ".epub"}

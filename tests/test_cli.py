@@ -73,6 +73,28 @@ def test_invalid_exclude_pattern_exits_2(tree, fake_engine):
     assert "Invalid exclude pattern" in res.output
 
 
+def test_workers_option(tree, fake_engine):
+    src, dst = tree
+    res = runner.invoke(cli.app, ["sync", str(src), str(dst), "--workers", "3"])
+    assert res.exit_code == 0, res.output
+    assert (dst / "a.md").exists() and (dst / "sub" / "b.md").exists()
+    assert "converting with 3 workers" in res.output
+
+
+def test_workers_min_one(tree, fake_engine):
+    src, dst = tree
+    res = runner.invoke(cli.app, ["sync", str(src), str(dst), "-j", "0"])
+    assert res.exit_code == 2
+
+
+def test_non_parallel_safe_engine_warns(tree, fake_engine, monkeypatch):
+    src, dst = tree
+    monkeypatch.setattr(fake_engine, "parallel_safe", False)
+    res = runner.invoke(cli.app, ["sync", str(src), str(dst), "-j", "4"])
+    assert res.exit_code == 0, res.output
+    assert "using 1 worker" in res.output
+
+
 def test_convert_single_file_to_stdout(tree, fake_engine):
     src, _ = tree
     res = runner.invoke(cli.app, ["convert", str(src / "a.pdf")])

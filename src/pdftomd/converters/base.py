@@ -20,6 +20,8 @@ class Converter(ABC):
     name: str = "base"
     #: Lower-case file extensions (with leading dot) this backend accepts.
     extensions: frozenset[str] = frozenset()
+    #: False when instances must not be used from several threads at once (shared models).
+    parallel_safe: bool = True
 
     def supports(self, path: str | Path) -> bool:
         return Path(path).suffix.lower() in self.extensions

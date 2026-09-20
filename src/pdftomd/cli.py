@@ -28,6 +28,7 @@ Langs = typer.Option(None, "--lang", help="(marker) OCR language(s), e.g. --lang
 GeminiModel = typer.Option(DEFAULT_MODEL, "--gemini-model", help="(gemini) Model name.")
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
 GeminiTimeout = typer.Option(300.0, "--gemini-timeout", help="(gemini) Per-request timeout in seconds; stalled requests are retried.")
+Workers = typer.Option(5, "--workers", "-j", min=1, help="Number of documents converted in parallel (gemini engine only; marker always uses 1).")
 ExcludeName = typer.Option(None, "--exclude-name", "-x", help="Skip files/directories whose name fully matches this regex (any depth). Repeatable.")
 ExcludePath = typer.Option(None, "--exclude-path", "-X", help="Skip files/directories whose source-relative path matches this regex (directories end with '/'). Repeatable.")
 GDrive = typer.Option(
@@ -90,14 +91,19 @@ def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
     )
 
 
-def _run(syncer: Syncer, plan: SyncPlan, prune: bool) -> int:
+def _run(syncer: Syncer, plan: SyncPlan, prune: bool, workers: int) -> int:
     def done(item: PlannedItem, i: int, n: int, elapsed: float) -> None:
         typer.echo(f"[{i}/{n}] {item.rel_path} ({item.reason.value}) — {elapsed:.1f}s", err=True)
 
     def error(item: PlannedItem, exc: Exception) -> None:
         typer.secho(f"  FAILED {item.rel_path}: {exc}", fg=typer.colors.RED, err=True)
 
-    result = syncer.execute(plan, prune=prune, on_done=done, on_error=error)
+    eff = syncer.effective_workers(workers)
+    if eff != workers:
+        typer.secho(f"note: {syncer.converter.name} engine is not parallel-safe, using 1 worker", fg=typer.colors.YELLOW, err=True)
+    elif eff > 1 and plan.to_generate:
+        typer.echo(f"-- converting with {eff} workers", err=True)
+    result = syncer.execute(plan, prune=prune, workers=workers, on_done=done, on_error=error)
     typer.echo(f"-- generated {len(result.generated)}, failed {len(result.failed)}, pruned {len(result.pruned)}", err=True)
     return 1 if result.failed else 0
 
@@ -123,6 +129,7 @@ def sync(
     prune: bool = typer.Option(False, "--prune", help="Delete destination .md files whose source no longer exists."),
     exclude_name: Optional[list[str]] = ExcludeName,
     exclude_path: Optional[list[str]] = ExcludePath,
+    workers: int = Workers,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
     use_gdrive: Optional[bool] = GDrive,
     force_ocr: bool = ForceOcr,
@@ -143,7 +150,7 @@ def sync(
     _print_plan(plan, verbose=verbose or dry_run)
     if dry_run:
         raise typer.Exit(1 if plan.errors else 0)
-    raise typer.Exit(_run(syncer, plan, prune))
+    raise typer.Exit(_run(syncer, plan, prune, workers))
 
 
 @app.command("list")
@@ -206,6 +213,7 @@ def watch(
     prune: bool = typer.Option(False, "--prune", help="Delete destination .md files whose source disappeared."),
     exclude_name: Optional[list[str]] = ExcludeName,
     exclude_path: Optional[list[str]] = ExcludePath,
+    workers: int = Workers,
     use_gdrive: Optional[bool] = GDrive,
     force_ocr: bool = ForceOcr,
     use_llm: bool = UseLlm,
@@ -222,7 +230,7 @@ def watch(
         while True:
             plan = syncer.plan()
             if plan.to_generate or plan.errors or (prune and plan.orphans):
-                _run(syncer, plan, prune)
+                _run(syncer, plan, prune, workers)
             time.sleep(interval)
     except KeyboardInterrupt:
         typer.echo("stopped", err=True)

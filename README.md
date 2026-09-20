@@ -66,6 +66,7 @@ pdftomd sync  ./docs ./docs-md --dry-run
 # Incremental sync: only new / changed / missing outputs are regenerated.
 pdftomd sync ./docs ./docs-md --engine marker --force-ocr
 pdftomd sync ./docs ./docs-md --engine gemini --gemini-model <other-model>   # override the default
+pdftomd sync ./docs ./docs-md --engine gemini --workers 8   # parallel API calls (default 5)
 
 # Force specific files (relative to the source dir), even if up to date.
 pdftomd sync ./docs ./docs-md --select reports/2024/q3.pdf --select scans/invoice.png
@@ -168,7 +169,7 @@ syncer = Syncer("docs", "docs-md", get_converter("marker", force_ocr=True),
 plan = syncer.plan()                          # dry run, pure
 for item in plan.to_generate:
     print(item.reason.value, item.rel_path)
-result = syncer.execute(plan, prune=False)    # writes .md files + manifest
+result = syncer.execute(plan, workers=5)      # writes .md files + manifest
 result = syncer.sync(select=["a/b.pdf"])      # force selected files
 
 # Google Drive stubs (after `pdftomd gdrive login`).
@@ -188,7 +189,9 @@ implement `convert_bytes(data, *, filename) -> str`.
 * **gemini**: the whole document is sent in one request with a strict
   transcription prompt (merge multi-page tables, mark `[illegible]` rather than
   guess, temperature 0). Files over ~20 MB go through the Files API; output
-  truncated at the token limit is continued automatically. Every API call has a
+  truncated at the token limit is continued automatically. Documents are
+  converted `--workers` at a time (default 5); marker always runs one at a time
+  because its models are shared. Every API call has a
   300 s timeout (`--gemini-timeout`) and is retried, so a stalled connection
   cannot hang the sync.
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,35 @@ class FakeConverter(Converter):
         if filename in self.fail_on:
             raise ConversionError("boom")
         return f"# {filename}\n\n{hashlib.sha256(data).hexdigest()[:8]}\n"
+
+
+class SlowConverter(FakeConverter):
+    def __init__(self, delay: float, fail_on: set[str] | None = None) -> None:
+        super().__init__(fail_on)
+        self.delay = delay
+        self.active = 0
+        self.max_active = 0
+        self._lock = threading.Lock()
+
+    def convert_bytes(self, data: bytes, *, filename: str) -> str:
+        with self._lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(self.delay)
+            return super().convert_bytes(data, filename=filename)
+        finally:
+            with self._lock:
+                self.active -= 1
+
+
+@pytest.fixture
+def widetree(tmp_path: Path):
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(8):
+        (src / f"f{i}.pdf").write_bytes(f"content-{i}".encode())
+    return src, tmp_path / "dst"
 
 
 @pytest.fixture
@@ -253,12 +284,91 @@ def test_on_done_reports_elapsed_per_file(tree):
     syncer = Syncer(src, dst, FakeConverter())
     syncer.execute(
         syncer.plan(),
+        workers=1,
         on_done=lambda item, i, n, elapsed: calls.append((item.rel_path, i, n, elapsed)),
     )
     assert [c[0] for c in calls] == ["root.pdf", "a/one.pdf", "a/b/two.png"]
     assert all(c[2] == 3 for c in calls)
     assert [c[1] for c in calls] == [1, 2, 3]
     assert all(c[3] >= 0 for c in calls)
+
+
+def test_parallel_execute(widetree):
+    src, dst = widetree
+    conv = SlowConverter(0.05)
+    syncer = Syncer(src, dst, conv)
+    started = time.monotonic()
+    result = syncer.execute(syncer.plan(), workers=4)
+    elapsed = time.monotonic() - started
+    assert len(result.generated) == 8
+    assert conv.max_active >= 2  # actually parallel
+    assert elapsed < 0.3  # 8 * 0.05 sequential would take 0.4s
+    manifest = json.loads((dst / MANIFEST_NAME).read_text())
+    assert len(manifest["files"]) == 8
+    for i in range(8):
+        assert (dst / f"f{i}.md").read_text().startswith(f"# f{i}.pdf")
+
+
+def test_non_parallel_safe_converter_uses_one_worker(widetree):
+    src, dst = widetree
+
+    class Serial(SlowConverter):
+        parallel_safe = False
+
+    conv = Serial(0.01)
+    syncer = Syncer(src, dst, conv)
+    assert syncer.effective_workers(4) == 1
+    result = syncer.execute(syncer.plan(), workers=4)
+    assert len(result.generated) == 8
+    assert conv.max_active == 1
+
+
+def test_parallel_failures_do_not_stop_others(widetree):
+    src, dst = widetree
+    conv = SlowConverter(0.01, fail_on={"f2.pdf", "f5.pdf"})
+    syncer = Syncer(src, dst, conv)
+    result = syncer.execute(syncer.plan(), workers=4)
+    assert set(result.failed) == {"f2.pdf", "f5.pdf"}
+    assert len(result.generated) == 6
+    assert not (dst / "f2.md").exists() and not (dst / "f5.md").exists()
+    manifest = json.loads((dst / MANIFEST_NAME).read_text())
+    assert len(manifest["files"]) == 6
+
+
+def test_on_done_and_on_progress_indices(widetree):
+    src, dst = widetree
+    done_calls, progress_calls = [], []
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.execute(
+        syncer.plan(),
+        workers=4,
+        on_progress=lambda item, i, n: progress_calls.append((item.rel_path, i, n)),
+        on_done=lambda item, i, n, elapsed: done_calls.append((item.rel_path, i, n)),
+    )
+    assert [c[1] for c in done_calls] == list(range(1, 9))
+    assert sorted(c[0] for c in done_calls) == [f"f{i}.pdf" for i in range(8)]
+    assert [c[1] for c in progress_calls] == list(range(1, 9))
+    assert all(c[2] == 8 for c in done_calls + progress_calls)
+
+
+def test_workers_one_goes_through_pool(widetree):
+    src, dst = widetree
+    conv = SlowConverter(0.01)
+    result = Syncer(src, dst, conv).execute(Syncer(src, dst, conv).plan(), workers=1)
+    assert len(result.generated) == 8
+    assert conv.max_active == 1
+
+
+def test_unexpected_worker_exception_propagates(widetree):
+    src, dst = widetree
+
+    class Broken(FakeConverter):
+        def convert_bytes(self, data: bytes, *, filename: str) -> str:
+            raise RuntimeError("not a ConversionError")
+
+    syncer = Syncer(src, dst, Broken())
+    with pytest.raises(RuntimeError):
+        syncer.execute(syncer.plan(), workers=2)
 
 
 def test_dest_inside_source_rejected(tree):

@@ -14,10 +14,14 @@ file. A source file is (re)generated when any of the following holds:
 Files and directories can be excluded from the walk with ``exclude_name``
 (bare-name regex) and ``exclude_path`` (source-relative path regex); hidden
 entries are always skipped.
+
+Conversion runs in a thread pool (``workers``); manifest updates and callbacks
+happen on the calling thread.
 """
 
 from __future__ import annotations
 
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -299,11 +303,27 @@ class Syncer:
 
     # -- execution -----------------------------------------------------------
 
+    def effective_workers(self, workers: int) -> int:
+        """Worker count actually used: ``max(1, workers)``, or 1 when the converter is not ``parallel_safe``."""
+        return max(1, workers) if self.converter.parallel_safe else 1
+
+    def _convert_item(self, item: PlannedItem) -> tuple[os.stat_result, str, str, float]:
+        """Worker: convert one item and write its .md via tmp + os.replace. Runs in the pool."""
+        started = time.monotonic()
+        st = item.source.stat()
+        markdown, fingerprint, engine = self._produce(item.source)
+        item.destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp = item.destination.with_name(item.destination.name + ".tmp")
+        tmp.write_text(markdown, "utf-8")
+        os.replace(tmp, item.destination)
+        return st, fingerprint, engine, time.monotonic() - started
+
     def execute(
         self,
         plan: SyncPlan,
         *,
         prune: bool = False,
+        workers: int = 5,
         on_progress: Callable[[PlannedItem, int, int], None] | None = None,
         on_done: Callable[[PlannedItem, int, int, float], None] | None = None,
         on_error: Callable[[PlannedItem, Exception], None] | None = None,
@@ -312,34 +332,57 @@ class Syncer:
         result.failed.update(plan.errors)
         total = len(plan.to_generate)
         self.dest_dir.mkdir(parents=True, exist_ok=True)
-        for index, item in enumerate(plan.to_generate, 1):
+        effective = self.effective_workers(workers)
+        pending = iter(enumerate(plan.to_generate, 1))
+        in_flight: dict[concurrent.futures.Future, PlannedItem] = {}
+        done_index = 0
+
+        def submit_next(executor: concurrent.futures.ThreadPoolExecutor) -> bool:
+            try:
+                index, item = next(pending)
+            except StopIteration:
+                return False
             if on_progress:
                 on_progress(item, index, total)
-            started = time.monotonic()
-            try:
-                st = item.source.stat()
-                markdown, fingerprint, engine = self._produce(item.source)
-            except (ConversionError, OSError) as exc:
-                result.failed[item.rel_path] = str(exc)
-                if on_error:
-                    on_error(item, exc)
-                continue
-            item.destination.parent.mkdir(parents=True, exist_ok=True)
-            tmp = item.destination.with_name(item.destination.name + ".tmp")
-            tmp.write_text(markdown, "utf-8")
-            os.replace(tmp, item.destination)
-            self.manifest.entries[item.rel_path] = ManifestEntry(
-                fingerprint=fingerprint,
-                size=st.st_size,
-                mtime=st.st_mtime,
-                engine=engine,
-                output=item.destination.relative_to(self.dest_dir).as_posix(),
-                generated_at=time.time(),
-            )
-            result.generated.append(item.rel_path)
-            self.manifest.save()  # persist after each file so a crash loses nothing
-            if on_done:
-                on_done(item, index, total, time.monotonic() - started)
+            in_flight[executor.submit(self._convert_item, item)] = item
+            return True
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=effective)
+        try:
+            for _ in range(effective):
+                if not submit_next(executor):
+                    break
+            while in_flight:
+                finished, _ = concurrent.futures.wait(in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
+                for fut in finished:
+                    item = in_flight.pop(fut)
+                    exc = fut.exception()
+                    if exc is not None:
+                        if not isinstance(exc, (ConversionError, OSError)):
+                            raise exc
+                        result.failed[item.rel_path] = str(exc)
+                        if on_error:
+                            on_error(item, exc)
+                        continue
+                    st, fingerprint, engine, elapsed = fut.result()
+                    self.manifest.entries[item.rel_path] = ManifestEntry(
+                        fingerprint=fingerprint,
+                        size=st.st_size,
+                        mtime=st.st_mtime,
+                        engine=engine,
+                        output=item.destination.relative_to(self.dest_dir).as_posix(),
+                        generated_at=time.time(),
+                    )
+                    result.generated.append(item.rel_path)
+                    self.manifest.save()  # persist after each file so a crash loses nothing
+                    done_index += 1
+                    if on_done:
+                        on_done(item, done_index, total, elapsed)
+                for _ in range(len(finished)):
+                    if not submit_next(executor):
+                        break
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
         if prune:
             for orphan in plan.orphans:
@@ -352,5 +395,13 @@ class Syncer:
         self.manifest.save()
         return result
 
-    def sync(self, *, force: bool = False, select: Iterable[str | Path] | None = None, prune: bool = False, **callbacks) -> SyncResult:
-        return self.execute(self.plan(force=force, select=select), prune=prune, **callbacks)
+    def sync(
+        self,
+        *,
+        force: bool = False,
+        select: Iterable[str | Path] | None = None,
+        prune: bool = False,
+        workers: int = 5,
+        **callbacks,
+    ) -> SyncResult:
+        return self.execute(self.plan(force=force, select=select), prune=prune, workers=workers, **callbacks)
