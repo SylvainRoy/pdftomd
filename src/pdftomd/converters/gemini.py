@@ -86,7 +86,9 @@ class GeminiConverter(Converter):
 
     def convert_bytes(self, data: bytes, *, filename: str) -> str:
         from google.genai import types
+        from ..pdfcheck import ensure_pdf_readable
 
+        ensure_pdf_readable(data, filename=filename)
         client = self._get_client()
         mime = guess_mime(filename)
         uploaded = None

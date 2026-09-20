@@ -197,6 +197,11 @@ implement `convert_bytes(data, *, filename) -> str`.
 
 ## Troubleshooting
 
+**`PDF is password-protected and cannot be converted`** — the source PDF needs a
+user password to open; pdftomd does not decrypt documents. The file is reported
+as failed and retried on each run; exclude it (`-X 'path/to/file\.pdf$'`) or
+store an unlocked copy elsewhere.
+
 **`CERTIFICATE_VERIFY_FAILED ... self-signed certificate in certificate chain`**
 when marker downloads its models: you are behind a TLS-inspecting proxy
 (Netskope, Zscaler, ...). Python does not use the macOS keychain, so export the

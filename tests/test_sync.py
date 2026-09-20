@@ -371,6 +371,53 @@ def test_unexpected_worker_exception_propagates(widetree):
         syncer.execute(syncer.plan(), workers=2)
 
 
+def test_encrypted_pdf_fails_clearly_and_is_retried(tree):
+    import io
+
+    from pypdf import PdfWriter
+
+    from pdftomd.pdfcheck import EncryptedPdfError, ensure_pdf_readable
+
+    class CheckingConverter(FakeConverter):
+        def convert_bytes(self, data: bytes, *, filename: str) -> str:
+            ensure_pdf_readable(data, filename=filename)
+            return super().convert_bytes(data, filename=filename)
+
+    src, dst = tree
+
+    # The fixture's .pdf payloads are fake bytes; replace them with a real PDF
+    # so only the encrypted one is rejected by the check.
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument.new()
+    doc.new_page(200, 200)
+    buf = io.BytesIO()
+    doc.save(buf)
+    real_pdf = buf.getvalue()
+    (src / "root.pdf").write_bytes(real_pdf)
+    (src / "a" / "one.pdf").write_bytes(real_pdf)
+
+    w = PdfWriter()
+    w.add_blank_page(200, 200)
+    w.encrypt(user_password="secret", owner_password="owner")
+    buf = io.BytesIO()
+    w.write(buf)
+    (src / "locked.pdf").write_bytes(buf.getvalue())
+
+    syncer = Syncer(src, dst, CheckingConverter())
+    result = syncer.execute(syncer.plan())
+    assert "locked.pdf" in result.failed
+    assert "password-protected" in result.failed["locked.pdf"]
+    assert isinstance(EncryptedPdfError("x"), ConversionError)
+    assert len(result.generated) == 3
+    assert not (dst / "locked.md").exists()
+
+    # Retried on the next run: still reported as new.
+    plan = Syncer(src, dst, CheckingConverter()).plan()
+    assert [i.rel_path for i in plan.to_generate] == ["locked.pdf"]
+    assert plan.to_generate[0].reason is Reason.NEW
+
+
 def test_dest_inside_source_rejected(tree):
     src, _ = tree
     with pytest.raises(ValueError):

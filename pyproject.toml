@@ -7,6 +7,7 @@ requires-python = ">=3.10,<3.14"
 license = { text = "MIT" }
 dependencies = [
     "typer>=0.12,<1.0",
+    "pypdfium2>=4.30,<6",
 ]
 
 [project.optional-dependencies]
@@ -26,7 +27,7 @@ build-backend = "hatchling.build"
 packages = ["src/pdftomd"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pypdf>=4"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

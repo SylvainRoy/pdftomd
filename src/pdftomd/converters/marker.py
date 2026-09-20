@@ -66,6 +66,10 @@ class MarkerConverter(Converter):
         from marker.output import text_from_rendered
 
         path = Path(path)
+        if path.suffix.lower() == ".pdf":
+            from ..pdfcheck import ensure_pdf_readable
+
+            ensure_pdf_readable(path.read_bytes(), filename=path.name)
         try:
             rendered = self._get_converter()(str(path))
             text, _, _images = text_from_rendered(rendered)
