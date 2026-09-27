@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -169,6 +170,18 @@ def test_orphans_and_prune(tree):
     assert result.pruned == ["root.md"]
     assert not (dst / "root.md").exists()
     assert "root.pdf" not in json.loads((dst / MANIFEST_NAME).read_text())["files"]
+
+
+def test_prune_removes_empty_directories(tree):
+    src, dst = tree
+    conv = FakeConverter()
+    Syncer(src, dst, conv).sync()
+    assert (dst / "a" / "b").is_dir()
+    shutil.rmtree(src / "a")
+    Syncer(src, dst, conv).sync(prune=True)
+    assert not (dst / "a").exists()
+    assert (dst / "root.md").exists()
+    assert (dst / MANIFEST_NAME).exists()
 
 
 def test_exclude_name_matches_dirs_and_files(extree):
