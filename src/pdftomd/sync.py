@@ -392,8 +392,20 @@ class Syncer:
             for rel in list(self.manifest.entries):
                 if rel not in live:
                     del self.manifest.entries[rel]
+            self._remove_empty_dirs()
         self.manifest.save()
         return result
+
+    def _remove_empty_dirs(self) -> None:
+        """Drop empty (non-hidden) directories left in the destination, deepest first."""
+        for root, dirs, files in os.walk(self.dest_dir, topdown=False):
+            path = Path(root)
+            if path == self.dest_dir or path.name.startswith(".") or files:
+                continue
+            try:
+                path.rmdir()
+            except OSError:
+                pass
 
     def sync(
         self,
