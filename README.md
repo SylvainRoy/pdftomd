@@ -18,7 +18,7 @@ Drive API, see [Google Drive documents](#google-drive-documents).
 ## Install
 
 ```bash
-uv sync --group dev                 # core + tests
+uv sync --group dev                 # core + pytest (see Development for the full test setup)
 uv sync --extra marker              # + marker-pdf (downloads models on first run)
 uv sync --extra gemini              # + google-genai (needs GEMINI_API_KEY)
 uv sync --extra gdrive              # + Google Drive API client + openpyxl
@@ -222,6 +222,13 @@ and can look idle for several minutes; later runs start immediately.
 
 ## Development
 
+The test suite imports the `gemini` and `gdrive` extras (marker is not needed):
+
 ```bash
+uv sync --group dev --extra gemini --extra gdrive
 uv run pytest
 ```
+
+If `uv run pytest` fails with `Failed to spawn: pytest` after moving the
+repository, the `.venv` launchers still point at the old path; run
+`uv sync --reinstall` to rebuild it.
