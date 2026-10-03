@@ -10,7 +10,7 @@ import typer
 from . import __version__
 from .converters import ENGINES, ConversionError, get_converter
 from .converters.gemini import DEFAULT_MODEL
-from .sync import PlannedItem, Syncer, SyncPlan
+from .sync import PlannedItem, Reason, Syncer, SyncPlan
 
 app = typer.Typer(
     help="Convert documents (PDF, scans, Google Docs, ...) to Markdown. One-way, incremental, source is never modified.",
@@ -71,7 +71,10 @@ def _syncer(source: Path, dest: Path, conv, gdrive, exclude_name: Optional[list[
 
 def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
     for item in plan.to_generate:
-        typer.echo(f"[{item.reason.value:>14}] {item.rel_path}")
+        if item.reason is Reason.MOVED:
+            typer.echo(f"[{item.reason.value:>14}] {item.moved_from} -> {item.rel_path}")
+        else:
+            typer.echo(f"[{item.reason.value:>14}] {item.rel_path}")
     if verbose:
         for rel in plan.up_to_date:
             typer.echo(f"[    up-to-date] {rel}")
@@ -83,8 +86,9 @@ def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
         typer.echo(f"[        orphan] {orphan}")
     for rel, msg in plan.errors.items():
         typer.secho(f"[         error] {rel}: {msg}", fg=typer.colors.RED)
+    moved = sum(1 for i in plan.to_generate if i.reason is Reason.MOVED)
     typer.echo(
-        f"-- {len(plan.to_generate)} to generate, {len(plan.up_to_date)} up to date, "
+        f"-- {len(plan.to_generate) - moved} to generate, {moved} to move, {len(plan.up_to_date)} up to date, "
         f"{len(plan.unsupported)} unsupported, {len(plan.excluded)} excluded, "
         f"{len(plan.orphans)} orphan output(s), {len(plan.errors)} error(s)",
         err=True,
@@ -104,7 +108,10 @@ def _run(syncer: Syncer, plan: SyncPlan, prune: bool, workers: int) -> int:
     elif eff > 1 and plan.to_generate:
         typer.echo(f"-- converting with {eff} workers", err=True)
     result = syncer.execute(plan, prune=prune, workers=workers, on_done=done, on_error=error)
-    typer.echo(f"-- generated {len(result.generated)}, failed {len(result.failed)}, pruned {len(result.pruned)}", err=True)
+    typer.echo(
+        f"-- generated {len(result.generated)}, moved {len(result.moved)}, failed {len(result.failed)}, pruned {len(result.pruned)}",
+        err=True,
+    )
     return 1 if result.failed else 0
 
 

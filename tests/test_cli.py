@@ -54,6 +54,24 @@ def test_sync_then_list_then_select(tree, fake_engine):
     assert res.exit_code == 2
 
 
+def test_moved_file_is_reported_and_relocated(tree, fake_engine):
+    src, dst = tree
+    assert runner.invoke(cli.app, ["sync", str(src), str(dst)]).exit_code == 0
+    (src / "sub" / "b.pdf").rename(src / "c.pdf")
+
+    res = runner.invoke(cli.app, ["sync", str(src), str(dst), "--dry-run"])
+    assert res.exit_code == 0, res.output
+    assert "[         moved] sub/b.pdf -> c.pdf" in res.output
+    assert "orphan" not in res.output.split("--")[0]
+    assert "0 to generate, 1 to move" in res.output
+
+    res = runner.invoke(cli.app, ["sync", str(src), str(dst)])
+    assert res.exit_code == 0, res.output
+    assert "generated 0, moved 1" in res.output
+    assert (dst / "c.md").exists() and not (dst / "sub").exists()
+    assert len(fake_engine.calls) == 2
+
+
 def test_exclude_flags(tree, fake_engine):
     src, dst = tree
     (src / "old").mkdir()
