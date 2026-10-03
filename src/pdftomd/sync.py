@@ -11,6 +11,10 @@ file. A source file is (re)generated when any of the following holds:
 * the destination Markdown file is missing,
 * it was explicitly selected / ``force`` was requested.
 
+A new source file whose fingerprint matches a manifest entry whose own source
+has vanished is treated as *moved*: its existing Markdown is relocated in the
+destination instead of being converted again.
+
 Files and directories can be excluded from the walk with ``exclude_name``
 (bare-name regex) and ``exclude_path`` (source-relative path regex); hidden
 entries are always skipped.
@@ -48,6 +52,7 @@ class Reason(str, Enum):
     ENGINE_CHANGED = "engine-changed"
     OUTPUT_MISSING = "output-missing"
     FORCED = "forced"
+    MOVED = "moved"
 
 
 @dataclass(frozen=True)
@@ -56,6 +61,7 @@ class PlannedItem:
     source: Path
     destination: Path
     reason: Reason
+    moved_from: str | None = None  # previous source rel path when ``reason`` is MOVED
 
 
 @dataclass
@@ -71,6 +77,7 @@ class SyncPlan:
 @dataclass
 class SyncResult:
     generated: list[str] = field(default_factory=list)
+    moved: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     pruned: list[str] = field(default_factory=list)
 
@@ -208,6 +215,7 @@ class Syncer:
         """
         selected = {self._rel(s) for s in select} if select else None
         plan = SyncPlan()
+        seen_sources: set[str] = set()
         seen_outputs: set[str] = set()
         if self.gdrive is not None:
             self.gdrive.clear_cache()  # fresh remote metadata for this run
@@ -218,6 +226,7 @@ class Syncer:
                     plan.unsupported.append(rel)
                 continue
             out_rel = markdown_path_for(rel)
+            seen_sources.add(rel)
             seen_outputs.add(out_rel)
             dest = self.dest_dir / out_rel
             if selected is not None:
@@ -242,15 +251,61 @@ class Syncer:
                         raise FileNotFoundError(f"{rel} is excluded by an exclude pattern")
                 raise FileNotFoundError(f"Selected files not found in source: {sorted(missing)}")
 
+        moved_outputs = self._detect_moves(plan, seen_sources)
+
         if self.dest_dir.is_dir():
             for root, dirs, files in os.walk(self.dest_dir):
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
                 for name in files:
                     p = Path(root) / name
                     rel_out = p.relative_to(self.dest_dir).as_posix()
-                    if p.suffix.lower() == ".md" and rel_out not in seen_outputs:
+                    if p.suffix.lower() == ".md" and rel_out not in seen_outputs and rel_out not in moved_outputs:
                         plan.orphans.append(p)
         return plan
+
+    def _detect_moves(self, plan: SyncPlan, seen_sources: set[str]) -> set[str]:
+        """Turn NEW items matching a vanished manifest entry into MOVED items.
+
+        A vanished entry is one whose source is no longer in the walk but whose
+        Markdown output still exists. Candidates are matched on engine and
+        fingerprint (size is checked first for local files so that hashing is
+        only done when a match is plausible). Returns the outputs claimed by
+        moves so they are not reported as orphans.
+        """
+        claimed: set[str] = set()
+        if not any(i.reason is Reason.NEW for i in plan.to_generate):
+            return claimed
+        vanished: dict[tuple[str, str], list[str]] = {}
+        sizes: set[int] = set()
+        for rel, entry in self.manifest.entries.items():
+            if rel in seen_sources or not (self.dest_dir / entry.output).is_file():
+                continue
+            vanished.setdefault((entry.engine, entry.fingerprint), []).append(rel)
+            sizes.add(entry.size)
+        if not vanished:
+            return claimed
+
+        for index, item in enumerate(plan.to_generate):
+            if item.reason is not Reason.NEW:
+                continue
+            try:
+                if self._is_remote(item.source):
+                    info = self.gdrive.describe(item.source)
+                    engine = self.converter.name if info.needs_engine else _GDRIVE_ENGINE
+                    fingerprint = info.fingerprint
+                else:
+                    if item.source.stat().st_size not in sizes:
+                        continue
+                    engine, fingerprint = self.converter.name, file_sha256(item.source)
+            except (ConversionError, OSError):
+                continue
+            candidates = vanished.get((engine, fingerprint))
+            if not candidates:
+                continue
+            old_rel = candidates.pop(0)
+            claimed.add(self.manifest.entries[old_rel].output)
+            plan.to_generate[index] = PlannedItem(item.rel_path, item.source, item.destination, Reason.MOVED, old_rel)
+        return claimed
 
     def _selection_excluded(self, rel: str) -> bool:
         """True if ``rel`` (a selected path missing from the walk) is excluded by a pattern."""
@@ -308,9 +363,17 @@ class Syncer:
         return max(1, workers) if self.converter.parallel_safe else 1
 
     def _convert_item(self, item: PlannedItem) -> tuple[os.stat_result, str, str, float]:
-        """Worker: convert one item and write its .md via tmp + os.replace. Runs in the pool."""
+        """Worker: convert one item and write its .md via tmp + os.replace. Runs in the pool.
+
+        MOVED items are not converted: the previous Markdown is relocated.
+        """
         started = time.monotonic()
         st = item.source.stat()
+        if item.reason is Reason.MOVED:
+            previous = self.manifest.entries[item.moved_from]
+            item.destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(self.dest_dir / previous.output, item.destination)
+            return st, previous.fingerprint, previous.engine, time.monotonic() - started
         markdown, fingerprint, engine = self._produce(item.source)
         item.destination.parent.mkdir(parents=True, exist_ok=True)
         tmp = item.destination.with_name(item.destination.name + ".tmp")
@@ -365,15 +428,21 @@ class Syncer:
                             on_error(item, exc)
                         continue
                     st, fingerprint, engine, elapsed = fut.result()
+                    generated_at = time.time()
+                    if item.reason is Reason.MOVED:
+                        generated_at = self.manifest.entries[item.moved_from].generated_at
+                        del self.manifest.entries[item.moved_from]
+                        result.moved.append(item.rel_path)
+                    else:
+                        result.generated.append(item.rel_path)
                     self.manifest.entries[item.rel_path] = ManifestEntry(
                         fingerprint=fingerprint,
                         size=st.st_size,
                         mtime=st.st_mtime,
                         engine=engine,
                         output=item.destination.relative_to(self.dest_dir).as_posix(),
-                        generated_at=time.time(),
+                        generated_at=generated_at,
                     )
-                    result.generated.append(item.rel_path)
                     self.manifest.save()  # persist after each file so a crash loses nothing
                     done_index += 1
                     if on_done:
@@ -392,6 +461,7 @@ class Syncer:
             for rel in list(self.manifest.entries):
                 if rel not in live:
                     del self.manifest.entries[rel]
+        if prune or result.moved:
             self._remove_empty_dirs()
         self.manifest.save()
         return result

@@ -191,6 +191,27 @@ def test_engine_change_only_affects_slides(tree, drive):
     assert {i.rel_path for i in plan.to_generate} == {"deck.gslides", "scan.pdf"}
 
 
+def test_moved_stub_relocates_markdown_without_export(tree, drive):
+    src, dst = tree
+    Syncer(src, dst, FakeConverter(), gdrive=GoogleDriveResolver(drive)).sync()
+    n = len(drive.export_calls)
+    (src / "archive").mkdir()
+    (src / "notes.gdoc").rename(src / "archive" / "notes-renamed.gdoc")
+    syncer = Syncer(src, dst, FakeConverter(), gdrive=GoogleDriveResolver(drive))
+    plan = syncer.plan()
+    assert [(i.rel_path, i.reason, i.moved_from) for i in plan.to_generate] == [
+        ("archive/notes-renamed.gdoc", Reason.MOVED, "notes.gdoc")
+    ]
+    assert plan.orphans == []
+    result = syncer.execute(plan)
+    assert result.moved == ["archive/notes-renamed.gdoc"]
+    assert len(drive.export_calls) == n
+    assert (dst / "archive" / "notes-renamed.md").read_text() == "# Notes\n\nHello\n"
+    assert not (dst / "notes.md").exists()
+    manifest = json.loads((dst / MANIFEST_NAME).read_text())["files"]
+    assert "notes.gdoc" not in manifest and manifest["archive/notes-renamed.gdoc"]["engine"] == "gdrive"
+
+
 def test_metadata_failure_is_reported_not_fatal(tree, drive):
     src, dst = tree
     write_stub(src / "gone.gdoc", "MISSING")

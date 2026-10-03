@@ -86,8 +86,11 @@ pdftomd watch ./docs ./docs-md --interval 30
 State is kept in `<dest>/.pdftomd-manifest.json` (SHA-256, size, mtime and
 engine per source file). A document is regenerated when it is new, its content
 hash changed, the engine changed, its `.md` is missing, or it was selected /
-forced. A touched-but-identical file is *not* regenerated. Destination files
-whose source vanished are reported as orphans and only deleted with `--prune`.
+forced. A touched-but-identical file is *not* regenerated. A document moved or
+renamed within the source tree (same content, new path) is reported as `moved`:
+its existing `.md` is relocated in the destination, nothing is reconverted.
+Destination files whose source vanished are reported as orphans and only
+deleted with `--prune`.
 
 ## Excluding files and directories
 

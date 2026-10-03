@@ -204,6 +204,108 @@ def test_orphans_and_prune(tree):
     assert "root.pdf" not in json.loads((dst / MANIFEST_NAME).read_text())["files"]
 
 
+def test_moved_source_relocates_markdown_without_converting(tree):
+    src, dst = tree
+    conv = FakeConverter()
+    Syncer(src, dst, conv).sync()
+    original = (dst / "a" / "one.md").read_text()
+    manifest = json.loads((dst / MANIFEST_NAME).read_text())["files"]
+    (src / "moved").mkdir()
+    shutil.move(src / "a" / "one.pdf", src / "moved" / "renamed.pdf")
+
+    syncer = Syncer(src, dst, conv)
+    plan = syncer.plan()
+    assert [(i.rel_path, i.reason, i.moved_from) for i in plan.to_generate] == [
+        ("moved/renamed.pdf", Reason.MOVED, "a/one.pdf")
+    ]
+    assert plan.orphans == []
+    assert (dst / "a" / "one.md").exists()  # plan alone never moves
+
+    result = syncer.execute(plan)
+    assert result.moved == ["moved/renamed.pdf"] and result.generated == []
+    assert len(conv.calls) == 3  # no reconversion
+    assert (dst / "moved" / "renamed.md").read_text() == original
+    assert not (dst / "a" / "one.md").exists()
+    assert (dst / "a" / "b" / "two.md").exists()
+    entries = json.loads((dst / MANIFEST_NAME).read_text())["files"]
+    assert "a/one.pdf" not in entries
+    assert entries["moved/renamed.pdf"]["fingerprint"] == manifest["a/one.pdf"]["fingerprint"]
+    assert entries["moved/renamed.pdf"]["output"] == "moved/renamed.md"
+    assert Syncer(src, dst, conv).plan().to_generate == []
+
+
+def test_moved_directory_relocates_all_outputs(tree):
+    src, dst = tree
+    conv = FakeConverter()
+    Syncer(src, dst, conv).sync()
+    shutil.move(src / "a", src / "archive")
+    result = Syncer(src, dst, conv).sync()
+    assert sorted(result.moved) == ["archive/b/two.png", "archive/one.pdf"]
+    assert len(conv.calls) == 3
+    assert (dst / "archive" / "one.md").exists() and (dst / "archive" / "b" / "two.md").exists()
+    assert not (dst / "a").exists()  # emptied directories are dropped
+
+
+def test_moved_and_modified_source_is_new(tree):
+    src, dst = tree
+    conv = FakeConverter()
+    Syncer(src, dst, conv).sync()
+    shutil.move(src / "root.pdf", src / "renamed.pdf")
+    (src / "renamed.pdf").write_bytes(b"edited")
+    plan = Syncer(src, dst, conv).plan()
+    assert [(i.rel_path, i.reason) for i in plan.to_generate] == [("renamed.pdf", Reason.NEW)]
+    assert [p.name for p in plan.orphans] == ["root.md"]
+
+
+def test_copied_source_is_new_not_moved(tree):
+    src, dst = tree
+    conv = FakeConverter()
+    Syncer(src, dst, conv).sync()
+    shutil.copy(src / "root.pdf", src / "copy.pdf")
+    plan = Syncer(src, dst, conv).plan()
+    assert [(i.rel_path, i.reason) for i in plan.to_generate] == [("copy.pdf", Reason.NEW)]
+    assert plan.orphans == []
+
+
+def test_move_requires_matching_engine(tree):
+    src, dst = tree
+    Syncer(src, dst, FakeConverter()).sync()
+    shutil.move(src / "root.pdf", src / "renamed.pdf")
+    other = FakeConverter()
+    other.name = "other"
+    plan = Syncer(src, dst, other).plan()
+    assert ("renamed.pdf", Reason.NEW) in [(i.rel_path, i.reason) for i in plan.to_generate]
+    assert [p.name for p in plan.orphans] == ["root.md"]
+
+
+def test_move_with_missing_old_output_is_new(tree):
+    src, dst = tree
+    conv = FakeConverter()
+    Syncer(src, dst, conv).sync()
+    (dst / "root.md").unlink()
+    shutil.move(src / "root.pdf", src / "renamed.pdf")
+    plan = Syncer(src, dst, conv).plan()
+    assert [(i.rel_path, i.reason) for i in plan.to_generate] == [("renamed.pdf", Reason.NEW)]
+
+
+def test_duplicate_sources_moved_once_each(tree):
+    src, dst = tree
+    conv = FakeConverter()
+    (src / "dup.pdf").write_bytes(b"root")  # same content as root.pdf
+    Syncer(src, dst, conv).sync()
+    shutil.move(src / "root.pdf", src / "x.pdf")
+    shutil.move(src / "dup.pdf", src / "y.pdf")
+    plan = Syncer(src, dst, conv).plan()
+    moves = sorted((i.rel_path, i.moved_from) for i in plan.to_generate if i.reason is Reason.MOVED)
+    assert [m[0] for m in moves] == ["x.pdf", "y.pdf"]
+    assert sorted(m[1] for m in moves) == ["dup.pdf", "root.pdf"]
+    assert plan.orphans == []
+    Syncer(src, dst, conv).execute(plan)
+    assert (dst / "x.md").exists() and (dst / "y.md").exists()
+    assert not (dst / "root.md").exists() and not (dst / "dup.md").exists()
+    assert len(conv.calls) == 4
+
+
 def test_prune_removes_empty_directories(tree):
     src, dst = tree
     conv = FakeConverter()
