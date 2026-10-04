@@ -7,7 +7,8 @@ Google Drive for Desktop stores native Google documents as tiny JSON stubs::
 The content lives online only, so this module fetches it through the Drive
 API (read-only scope) and turns it into Markdown:
 
-* Docs    -> exported natively as ``text/markdown``
+* Docs    -> exported natively as ``text/markdown``; embedded (base64) images
+             are replaced by a vision-model transcription when a describer is set
 * Sheets  -> exported as ``.xlsx`` and rendered as one GFM table per tab
 * Slides  -> exported as PDF, then handed to the selected conversion engine
 
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .converters.base import ConversionError
+from .images import ImageDescriber, describe_images
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 API = "https://www.googleapis.com/drive/v3/files"
@@ -208,8 +210,9 @@ class Document:
 class GoogleDriveResolver:
     extensions = STUB_EXTENSIONS
 
-    def __init__(self, client: DriveClient | None = None) -> None:
+    def __init__(self, client: DriveClient | None = None, describer: ImageDescriber | None = None) -> None:
         self.client: DriveClient = client or HttpDriveClient()
+        self.describer = describer  # replaces base64 images of Docs exports by text; None keeps them
         self._meta_cache: dict[str, dict[str, Any]] = {}
 
     def clear_cache(self) -> None:
@@ -238,8 +241,10 @@ class GoogleDriveResolver:
         stem = Path(path).stem
         if info.mime == MIME_DOC:
             try:
-                md = self.client.export(target, MIME_MD).decode("utf-8")
-                return Document(f"{stem}.md", info.fingerprint, markdown=_tidy(md))
+                md = _tidy(self.client.export(target, MIME_MD).decode("utf-8"))
+                if self.describer is not None:
+                    md = describe_images(md, self.describer)
+                return Document(f"{stem}.md", info.fingerprint, markdown=md)
             except GoogleDriveError as exc:
                 if "exportSizeLimitExceeded" not in str(exc):
                     raise

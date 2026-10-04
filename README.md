@@ -131,6 +131,17 @@ different credential from the Gemini API key — see
 | `.gsheet`   | exported as `.xlsx`, every visible tab rendered as a GFM table     | `gdrive`        |
 | `.gslides`  | exported as PDF, then converted by the selected `--engine`         | engine name     |
 
+Pictures embedded in a Google Doc come out of the Markdown export as huge
+base64 `data:image/...` blobs. When a Gemini API key is configured (any
+`--engine`), each embedded image is sent to `--gemini-model` and replaced by
+its transcription, introduced by an italic `*[Image: ...]*` line; without a key
+the blobs are kept as-is. Docs already converted before this existed are not
+regenerated automatically — select them explicitly:
+
+```bash
+pdftomd sync ./docs ./docs-md $(grep -rl "data:image/" ./docs-md | sed 's|^./docs-md/|--select |; s|\.md$|.gdoc|')
+```
+
 Change detection uses the remote `version` / `modifiedTime` as fingerprint,
 since the stub bytes never change when the document is edited online. Each
 `sync` costs one small metadata call per stub; content is downloaded only for

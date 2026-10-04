@@ -30,6 +30,16 @@ Rules:
 - Output ONLY the Markdown. No preamble, no code fence around the whole document.
 """
 
+IMAGE_PROMPT = """\
+This image was embedded in a document. Transcribe ALL the text it contains,
+faithfully and in reading order, as GitHub-Flavored Markdown (tables as GFM
+pipe tables, `[illegible]` for unreadable characters). Do not summarize or
+invent content. Start your answer with one italic line of the form
+*[Image: <one-sentence description of what the image shows>]*, then the
+transcription (nothing more if the image contains no text).
+Output ONLY the Markdown. No preamble, no code fence.
+"""
+
 CONTINUE_PROMPT = (
     "Your previous answer was cut off. Continue the Markdown transcription exactly "
     "from where you stopped, without repeating anything already emitted and without "
@@ -124,6 +134,15 @@ class GeminiConverter(Converter):
         else:
             raise ConversionError("Gemini output was still truncated after the maximum number of continuations.")
         return _strip_outer_fence("".join(chunks)).strip() + "\n"
+
+    def describe_image(self, data: bytes, mime: str) -> str:
+        """Transcribe/describe a single picture (used for images embedded in Google Docs exports)."""
+        from google.genai import types
+
+        client = self._get_client()
+        contents = [types.Content(role="user", parts=[types.Part.from_bytes(data=data, mime_type=mime), types.Part.from_text(text=IMAGE_PROMPT)])]
+        response = self._generate(client, contents, types.GenerateContentConfig(temperature=0.0))
+        return _strip_outer_fence(response.text or "").strip()
 
     def _upload(self, client, data: bytes, mime: str):
         last: Exception | None = None
