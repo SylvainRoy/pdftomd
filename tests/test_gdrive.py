@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import json
 from pathlib import Path
@@ -124,6 +125,33 @@ def test_resolver_doc_sheet_slides(tree, drive):
     assert deck.markdown is None and deck.data == b"%PDF-fake" and deck.filename == "deck.pdf"
     # metadata is cached per doc within a run
     assert drive.metadata_calls == 3
+
+
+PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+
+
+class FakeDescriber:
+    def __init__(self) -> None:
+        self.calls: list[tuple[bytes, str]] = []
+
+    def describe_image(self, data: bytes, mime: str) -> str:
+        self.calls.append((data, mime))
+        return f"*[Image: fake {len(data)} bytes]*\n\nTotal: 42 EUR"
+
+
+def test_resolver_describes_doc_images(tree, drive):
+    md = f"# Memo\n\nSee below.\n\n![][image1]\n\nEnd.\n\n[image1]: <data:image/png;base64,{PNG_B64}>\n"
+    drive.add("DOC2", MIME_DOC, "Memo", {MIME_MD: md.encode()})
+    src, _ = tree
+    stub = write_stub(src / "memo.gdoc", "DOC2")
+
+    plain = GoogleDriveResolver(client=drive).resolve(stub).markdown
+    assert "data:image/png;base64" in plain
+
+    describer = FakeDescriber()
+    doc = GoogleDriveResolver(client=drive, describer=describer).resolve(stub)
+    assert doc.markdown == "# Memo\n\nSee below.\n\n*[Image: fake 70 bytes]*\n\nTotal: 42 EUR\n\nEnd.\n"
+    assert describer.calls == [(base64.b64decode(PNG_B64), "image/png")]
 
 
 def test_resolver_rejects_unknown_type(tmp_path, drive):

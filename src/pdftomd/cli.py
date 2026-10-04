@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import time
 from pathlib import Path
@@ -48,7 +49,16 @@ def _converter(engine: str, force_ocr: bool, use_llm: bool, langs: Optional[list
     return get_converter("gemini", model=model, api_key=api_key, request_timeout=timeout)
 
 
-def _resolver(enabled: Optional[bool]):
+def _describer(conv, model: str, api_key: Optional[str], timeout: float):
+    """Gemini vision for images embedded in Google Docs exports; None when no key is configured."""
+    if hasattr(conv, "describe_image"):
+        return conv
+    if not (api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+        return None
+    return get_converter("gemini", model=model, api_key=api_key, request_timeout=timeout)
+
+
+def _resolver(enabled: Optional[bool], describer=None):
     from . import gdrive
 
     if enabled is None:
@@ -58,7 +68,7 @@ def _resolver(enabled: Optional[bool]):
     if not gdrive.has_token():
         typer.secho("Google Drive not configured; run `pdftomd gdrive login`.", fg=typer.colors.RED, err=True)
         raise typer.Exit(2)
-    return gdrive.GoogleDriveResolver()
+    return gdrive.GoogleDriveResolver(describer=describer)
 
 
 def _syncer(source: Path, dest: Path, conv, gdrive, exclude_name: Optional[list[str]], exclude_path: Optional[list[str]]) -> Syncer:
@@ -148,7 +158,7 @@ def sync(
 ) -> None:
     """Synchronise SOURCE into DEST, regenerating only stale Markdown files."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
-    syncer = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path)
+    syncer = _syncer(source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)), exclude_name, exclude_path)
     try:
         plan = syncer.plan(force=force, select=select or None)
     except FileNotFoundError as exc:
@@ -196,7 +206,7 @@ def convert(
     started = time.monotonic()
     try:
         if is_stub(file):
-            doc = GoogleDriveResolver().resolve(file)
+            doc = GoogleDriveResolver(describer=_describer(conv, gemini_model, gemini_api_key, gemini_timeout)).resolve(file)
             markdown = doc.markdown if doc.markdown is not None else conv.convert_bytes(doc.data, filename=doc.filename)
         else:
             markdown = conv.convert_file(file)
@@ -231,7 +241,7 @@ def watch(
 ) -> None:
     """Keep DEST in sync with SOURCE, re-scanning periodically until interrupted."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
-    syncer = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path)
+    syncer = _syncer(source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)), exclude_name, exclude_path)
     typer.echo(f"watching {syncer.source_dir} every {interval:g}s (Ctrl-C to stop)", err=True)
     try:
         while True:
