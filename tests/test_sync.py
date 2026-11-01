@@ -693,7 +693,7 @@ def test_vanished_source_output_remains_an_orphan(tree):
     assert plan.manual == []
 
 
-def test_unknown_markdown_collision_is_not_overwritten(tree):
+def test_untracked_source_output_is_new_not_adopted(tree):
     src, dst = tree
     dst.mkdir()
     output = dst / "root.md"
@@ -701,11 +701,20 @@ def test_unknown_markdown_collision_is_not_overwritten(tree):
 
     syncer = Syncer(src, dst, FakeConverter())
     plan = syncer.plan()
-    assert "root.pdf" in plan.errors
-    assert "output root.md is a manual Markdown file" == plan.errors["root.pdf"]
-    assert all(item.rel_path != "root.pdf" for item in plan.to_generate)
-    syncer.execute(plan)
-    assert output.read_text("utf-8") == "# Hand-written\n"
+    assert [
+        (item.rel_path, item.reason) for item in plan.to_generate if item.rel_path == "root.pdf"
+    ] == [("root.pdf", Reason.NEW)]
+    assert "root.pdf" not in plan.errors
+    assert all(item.action != ManualAction.ADOPTED for item in plan.manual)
+    assert output not in plan.orphans
+
+    selected_plan = syncer.plan(select=["root.pdf"])
+    assert [
+        (item.rel_path, item.reason)
+        for item in selected_plan.to_generate
+        if item.rel_path == "root.pdf"
+    ] == [("root.pdf", Reason.FORCED)]
+    assert "root.pdf" not in selected_plan.errors
 
 
 def test_source_output_cannot_collide_with_adopted_manual_markdown(tree):

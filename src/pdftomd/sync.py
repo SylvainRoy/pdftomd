@@ -248,6 +248,11 @@ class Syncer:
         plan = SyncPlan()
         seen_sources: set[str] = set()
         seen_outputs: set[str] = set()
+        manual_outputs = {
+            entry.output
+            for entry in self.manifest.entries.values()
+            if entry.engine == MANUAL_ENGINE
+        }
         if self.gdrive is not None:
             self.gdrive.clear_cache()  # fresh remote metadata for this run
 
@@ -261,15 +266,7 @@ class Syncer:
             seen_outputs.add(out_rel)
             dest = self.dest_dir / out_rel
             entry = self.manifest.entries.get(rel)
-            if any(
-                manifest_entry.engine == MANUAL_ENGINE and manifest_entry.output == out_rel
-                for manifest_entry in self.manifest.entries.values()
-            ):
-                plan.errors[rel] = f"output {out_rel} is a manual Markdown file"
-                continue
-            if dest.is_file() and not any(
-                manifest_entry.output == out_rel for manifest_entry in self.manifest.entries.values()
-            ):
+            if out_rel in manual_outputs:
                 plan.errors[rel] = f"output {out_rel} is a manual Markdown file"
                 continue
             if selected is not None:
