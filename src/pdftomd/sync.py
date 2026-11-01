@@ -21,6 +21,9 @@ entries are always skipped.
 
 Conversion runs in a thread pool (``workers``); manifest updates and callbacks
 happen on the calling thread.
+
+Engine-produced Markdown is checked for minimum non-whitespace content before
+it is written; Markdown exported directly by Google Drive is not checked.
 """
 
 from __future__ import annotations
@@ -36,7 +39,7 @@ from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Iterable
 
-from .converters.base import ConversionError, Converter
+from .converters.base import MIN_CONTENT_CHARS, ConversionError, Converter, ensure_content
 
 if TYPE_CHECKING:  # pragma: no cover
     from .gdrive import GoogleDriveResolver
@@ -150,6 +153,7 @@ class Syncer:
         follow_symlinks: bool = False,
         exclude_name: Iterable[str] | None = None,
         exclude_path: Iterable[str] | None = None,
+        min_chars: int = MIN_CONTENT_CHARS,
     ) -> None:
         self.source_dir = Path(source_dir).resolve()
         self.dest_dir = Path(dest_dir).resolve()
@@ -159,6 +163,7 @@ class Syncer:
             raise ValueError("Destination must not be the source directory or inside it.")
         self.converter = converter
         self.gdrive = gdrive
+        self.min_chars = min_chars
         if extensions:
             self.extensions = frozenset(e.lower() for e in extensions)
         else:
@@ -353,8 +358,17 @@ class Syncer:
             doc = self.gdrive.resolve(src)
             if doc.markdown is not None:
                 return doc.markdown, doc.fingerprint, _GDRIVE_ENGINE
-            return self.converter.convert_bytes(doc.data, filename=doc.filename), doc.fingerprint, self.converter.name
-        return self.converter.convert_file(src), file_sha256(src), self.converter.name
+            markdown = self.converter.convert_bytes(doc.data, filename=doc.filename)
+            fingerprint = doc.fingerprint
+        else:
+            markdown = self.converter.convert_file(src)
+            fingerprint = file_sha256(src)
+        markdown = ensure_content(
+            markdown,
+            filename=src.relative_to(self.source_dir).as_posix(),
+            min_chars=self.min_chars,
+        )
+        return markdown, fingerprint, self.converter.name
 
     # -- execution -----------------------------------------------------------
 

@@ -92,6 +92,11 @@ its existing `.md` is relocated in the destination, nothing is reconverted.
 Destination files whose source vanished are reported as orphans and only
 deleted with `--prune`.
 
+Engine output with fewer than `--min-chars` non-whitespace characters
+(default: 10) is reported as `FAILED` and no `.md` is written; the file is
+retried on the next sync. Drive-native `.gdoc` and `.gsheet` Markdown exports
+are not checked. Use `--min-chars 0` to disable this check.
+
 ## Excluding files and directories
 
 `sync`, `list` and `watch` accept two repeatable exclusion flags that apply to
