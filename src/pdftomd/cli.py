@@ -10,6 +10,7 @@ import typer
 
 from . import __version__
 from .converters import ENGINES, ConversionError, get_converter
+from .converters.base import MIN_CONTENT_CHARS, ensure_content
 from .converters.gemini import DEFAULT_MODEL
 from .sync import PlannedItem, Reason, Syncer, SyncPlan
 
@@ -30,6 +31,7 @@ GeminiModel = typer.Option(DEFAULT_MODEL, "--gemini-model", help="(gemini) Model
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
 GeminiTimeout = typer.Option(300.0, "--gemini-timeout", help="(gemini) Per-request timeout in seconds; stalled requests are retried.")
 Workers = typer.Option(5, "--workers", "-j", min=1, help="Number of documents converted in parallel (gemini engine only; marker always uses 1).")
+MinChars = typer.Option(MIN_CONTENT_CHARS, "--min-chars", min=0, help="Fail a conversion whose Markdown has fewer non-whitespace characters than this (engine output only; 0 disables).")
 ExcludeName = typer.Option(None, "--exclude-name", "-x", help="Skip files/directories whose name fully matches this regex (any depth). Repeatable.")
 ExcludePath = typer.Option(None, "--exclude-path", "-X", help="Skip files/directories whose source-relative path matches this regex (directories end with '/'). Repeatable.")
 GDrive = typer.Option(
@@ -71,9 +73,9 @@ def _resolver(enabled: Optional[bool], describer=None):
     return gdrive.GoogleDriveResolver(describer=describer)
 
 
-def _syncer(source: Path, dest: Path, conv, gdrive, exclude_name: Optional[list[str]], exclude_path: Optional[list[str]]) -> Syncer:
+def _syncer(source: Path, dest: Path, conv, gdrive, exclude_name: Optional[list[str]], exclude_path: Optional[list[str]], min_chars: int = MIN_CONTENT_CHARS) -> Syncer:
     try:
-        return Syncer(source, dest, conv, gdrive=gdrive, exclude_name=exclude_name, exclude_path=exclude_path)
+        return Syncer(source, dest, conv, gdrive=gdrive, exclude_name=exclude_name, exclude_path=exclude_path, min_chars=min_chars)
     except ValueError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(2)
@@ -147,6 +149,7 @@ def sync(
     exclude_name: Optional[list[str]] = ExcludeName,
     exclude_path: Optional[list[str]] = ExcludePath,
     workers: int = Workers,
+    min_chars: int = MinChars,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
     use_gdrive: Optional[bool] = GDrive,
     force_ocr: bool = ForceOcr,
@@ -158,7 +161,7 @@ def sync(
 ) -> None:
     """Synchronise SOURCE into DEST, regenerating only stale Markdown files."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
-    syncer = _syncer(source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)), exclude_name, exclude_path)
+    syncer = _syncer(source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)), exclude_name, exclude_path, min_chars)
     try:
         plan = syncer.plan(force=force, select=select or None)
     except FileNotFoundError as exc:
@@ -198,6 +201,7 @@ def convert(
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
     gemini_timeout: float = GeminiTimeout,
+    min_chars: int = MinChars,
 ) -> None:
     """Convert a single document (or Google Drive stub) and print the Markdown to stdout."""
     from .gdrive import GoogleDriveResolver, is_stub
@@ -207,9 +211,16 @@ def convert(
     try:
         if is_stub(file):
             doc = GoogleDriveResolver(describer=_describer(conv, gemini_model, gemini_api_key, gemini_timeout)).resolve(file)
-            markdown = doc.markdown if doc.markdown is not None else conv.convert_bytes(doc.data, filename=doc.filename)
+            if doc.markdown is not None:
+                markdown = doc.markdown
+            else:
+                markdown = ensure_content(
+                    conv.convert_bytes(doc.data, filename=doc.filename),
+                    filename=file.name,
+                    min_chars=min_chars,
+                )
         else:
-            markdown = conv.convert_file(file)
+            markdown = ensure_content(conv.convert_file(file), filename=file.name, min_chars=min_chars)
     except ConversionError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(1)
@@ -231,6 +242,7 @@ def watch(
     exclude_name: Optional[list[str]] = ExcludeName,
     exclude_path: Optional[list[str]] = ExcludePath,
     workers: int = Workers,
+    min_chars: int = MinChars,
     use_gdrive: Optional[bool] = GDrive,
     force_ocr: bool = ForceOcr,
     use_llm: bool = UseLlm,
@@ -241,7 +253,7 @@ def watch(
 ) -> None:
     """Keep DEST in sync with SOURCE, re-scanning periodically until interrupted."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
-    syncer = _syncer(source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)), exclude_name, exclude_path)
+    syncer = _syncer(source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)), exclude_name, exclude_path, min_chars)
     typer.echo(f"watching {syncer.source_dir} every {interval:g}s (Ctrl-C to stop)", err=True)
     try:
         while True:

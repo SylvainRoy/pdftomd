@@ -29,6 +29,18 @@ class FakeConverter(Converter):
         return f"# {filename}\n\n{hashlib.sha256(data).hexdigest()[:8]}\n"
 
 
+class OutputConverter(FakeConverter):
+    def __init__(self, outputs: dict[str, str]) -> None:
+        super().__init__()
+        self.outputs = outputs
+
+    def convert_bytes(self, data: bytes, *, filename: str) -> str:
+        if filename in self.outputs:
+            self.calls.append(filename)
+            return self.outputs[filename]
+        return super().convert_bytes(data, filename=filename)
+
+
 class SlowConverter(FakeConverter):
     def __init__(self, delay: float, fail_on: set[str] | None = None) -> None:
         super().__init__(fail_on)
@@ -188,6 +200,54 @@ def test_failure_does_not_poison_manifest(tree):
     # Next run retries only the failed one.
     plan = Syncer(src, dst, FakeConverter()).plan()
     assert [i.rel_path for i in plan.to_generate] == ["a/one.pdf"]
+
+
+def test_empty_engine_output_fails_and_is_retried(tree):
+    src, dst = tree
+    syncer = Syncer(src, dst, OutputConverter({"root.pdf": "x"}))
+    result = syncer.sync()
+
+    assert set(result.failed) == {"root.pdf"}
+    assert "non-whitespace" in result.failed["root.pdf"]
+    assert not (dst / "root.md").exists()
+    assert sorted(result.generated) == ["a/b/two.png", "a/one.pdf"]
+    manifest = json.loads((dst / MANIFEST_NAME).read_text())
+    assert "root.pdf" not in manifest["files"]
+    assert [item.rel_path for item in syncer.plan().to_generate] == ["root.pdf"]
+
+
+def test_whitespace_only_engine_output_fails(tree):
+    src, dst = tree
+    result = Syncer(src, dst, OutputConverter({"root.pdf": "  \n\n\t\n"})).sync()
+    assert set(result.failed) == {"root.pdf"}
+    assert "only 0 non-whitespace" in result.failed["root.pdf"]
+    assert not (dst / "root.md").exists()
+
+
+def test_min_chars_zero_accepts_tiny_engine_output(tree):
+    src, dst = tree
+    result = Syncer(src, dst, OutputConverter({"root.pdf": "x"}), min_chars=0).sync()
+    assert "root.pdf" in result.generated
+    assert not result.failed
+    assert (dst / "root.md").read_text() == "x"
+
+
+def test_empty_changed_conversion_preserves_existing_markdown(tree):
+    src, dst = tree
+    conv = OutputConverter({"root.pdf": "# good output\n"})
+    syncer = Syncer(src, dst, conv)
+    syncer.sync()
+    previous_markdown = (dst / "root.md").read_text()
+    previous_entry = json.loads((dst / MANIFEST_NAME).read_text())["files"]["root.pdf"]
+
+    (src / "root.pdf").write_bytes(b"changed")
+    conv.outputs["root.pdf"] = "x"
+    result = syncer.sync()
+
+    assert set(result.failed) == {"root.pdf"}
+    assert (dst / "root.md").read_text() == previous_markdown
+    manifest = json.loads((dst / MANIFEST_NAME).read_text())
+    assert manifest["files"]["root.pdf"] == previous_entry
 
 
 def test_orphans_and_prune(tree):

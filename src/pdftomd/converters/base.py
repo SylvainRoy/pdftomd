@@ -9,6 +9,24 @@ class ConversionError(Exception):
     """Raised when a backend fails to produce Markdown for a document."""
 
 
+MIN_CONTENT_CHARS = 10
+
+
+class EmptyOutputError(ConversionError):
+    """The engine produced (almost) no text: the document was probably not read correctly."""
+
+
+def ensure_content(markdown: str, *, filename: str, min_chars: int = MIN_CONTENT_CHARS) -> str:
+    n = len("".join(markdown.split()))
+    if min_chars > 0 and n < min_chars:
+        raise EmptyOutputError(
+            f"{filename}: conversion produced only {n} non-whitespace character(s) "
+            f"({len(markdown.encode('utf-8'))} bytes), below --min-chars {min_chars}; "
+            "the document was probably not read correctly"
+        )
+    return markdown
+
+
 class Converter(ABC):
     """A backend able to turn a document (bytes) into a Markdown string.
 
