@@ -20,6 +20,9 @@ from typing import Any
 from .converters import ENGINES, ConversionError, Converter, get_converter
 from .sync import (
     MANIFEST_NAME,
+    MANUAL_ENGINE,
+    ManualAction,
+    ManualItem,
     Manifest,
     PlannedItem,
     Reason,
@@ -57,6 +60,9 @@ def convert_file(path: str | Path, *, engine: str = "marker", gdrive: Any = None
 __all__ = [
     "ENGINES",
     "MANIFEST_NAME",
+    "MANUAL_ENGINE",
+    "ManualAction",
+    "ManualItem",
     "ConversionError",
     "Converter",
     "Manifest",

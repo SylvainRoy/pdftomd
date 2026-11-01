@@ -54,6 +54,23 @@ def test_sync_then_list_then_select(tree, fake_engine):
     assert res.exit_code == 2
 
 
+def test_list_adoption_flags_and_overwrite_edited_option(tree, fake_engine):
+    src, dst = tree
+    dst.mkdir()
+    (dst / "notes.md").write_text("# Notes\n", "utf-8")
+
+    res = runner.invoke(cli.app, ["list", str(src), str(dst)])
+    assert res.exit_code == 0, res.output
+    assert "[       adopted] notes.md" in res.output
+
+    res = runner.invoke(cli.app, ["list", str(src), str(dst), "--no-adopt"])
+    assert res.exit_code == 0, res.output
+    assert "[        orphan]" in res.output
+
+    res = runner.invoke(cli.app, ["sync", str(src), str(dst), "--overwrite-edited", "--dry-run"])
+    assert res.exit_code == 0, res.output
+
+
 def test_moved_file_is_reported_and_relocated(tree, fake_engine):
     src, dst = tree
     assert runner.invoke(cli.app, ["sync", str(src), str(dst)]).exit_code == 0

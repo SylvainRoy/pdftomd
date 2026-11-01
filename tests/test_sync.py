@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from pdftomd import MANIFEST_NAME, Reason, Syncer
+from pdftomd import MANIFEST_NAME, MANUAL_ENGINE, ManualAction, Reason, Syncer
 from pdftomd.converters.base import ConversionError, Converter
 
 
@@ -106,6 +106,8 @@ def test_initial_sync_mirrors_hierarchy(tree):
     assert (dst / "a" / "one.md").exists()
     assert (dst / "a" / "b" / "two.md").read_text().startswith("# two.png")
     assert (dst / MANIFEST_NAME).exists()
+    for entry in syncer.manifest.entries.values():
+        assert entry.md_sha256 == hashlib.sha256((dst / entry.output).read_bytes()).hexdigest()
     assert snapshot(src) == before  # source untouched
 
 
@@ -231,6 +233,7 @@ def test_moved_source_relocates_markdown_without_converting(tree):
     assert "a/one.pdf" not in entries
     assert entries["moved/renamed.pdf"]["fingerprint"] == manifest["a/one.pdf"]["fingerprint"]
     assert entries["moved/renamed.pdf"]["output"] == "moved/renamed.md"
+    assert entries["moved/renamed.pdf"]["md_sha256"] == manifest["a/one.pdf"]["md_sha256"]
     assert Syncer(src, dst, conv).plan().to_generate == []
 
 
@@ -557,3 +560,222 @@ def test_string_level_api_writes_nothing(tmp_path):
         pdftomd.get_converter = converters_get
     assert md.startswith("# x.pdf")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_manual_markdown_is_adopted_and_never_pruned(tree):
+    src, dst = tree
+    manual = dst / "notes" / "reunion.md"
+    manual.parent.mkdir(parents=True)
+    manual.write_text("# Notes\n", "utf-8")
+    syncer = Syncer(src, dst, FakeConverter())
+
+    plan = syncer.plan()
+    assert len(plan.manual) == 1
+    assert (plan.manual[0].rel_path, plan.manual[0].action) == ("notes/reunion.md", ManualAction.ADOPTED)
+    assert plan.orphans == []
+    assert not (dst / MANIFEST_NAME).exists()
+    result = syncer.execute(plan, prune=True)
+
+    entry = syncer.manifest.entries["notes/reunion.md"]
+    digest = hashlib.sha256(manual.read_bytes()).hexdigest()
+    assert result.manual[0].action is ManualAction.ADOPTED
+    assert entry.engine == MANUAL_ENGINE
+    assert entry.fingerprint == entry.md_sha256 == digest
+    assert entry.output == "notes/reunion.md"
+    assert entry.size == manual.stat().st_size
+    assert entry.mtime == manual.stat().st_mtime
+    assert manual.exists()
+    assert Syncer(src, dst, FakeConverter()).plan().manual == []
+
+
+def test_no_adopt_preserves_orphan_prune_behavior(tree):
+    src, dst = tree
+    manual = dst / "notes.md"
+    dst.mkdir()
+    manual.write_text("# Notes\n", "utf-8")
+    syncer = Syncer(src, dst, FakeConverter(), adopt=False)
+    plan = syncer.plan()
+    assert plan.manual == []
+    assert plan.orphans == [manual]
+
+    result = syncer.execute(plan, prune=True)
+    assert result.pruned == ["notes.md"]
+    assert not manual.exists()
+
+
+def test_manual_edit_refreshes_fingerprint(tree):
+    src, dst = tree
+    manual = dst / "notes.md"
+    dst.mkdir()
+    manual.write_text("# Notes\n", "utf-8")
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.execute(syncer.plan())
+    previous = syncer.manifest.entries["notes.md"].fingerprint
+
+    manual.write_text("# Updated notes\n", "utf-8")
+    plan = syncer.plan()
+    assert [(item.rel_path, item.action) for item in plan.manual] == [
+        ("notes.md", ManualAction.CHANGED)
+    ]
+    syncer.execute(plan)
+    entry = syncer.manifest.entries["notes.md"]
+    assert entry.fingerprint != previous
+    assert entry.fingerprint == hashlib.sha256(manual.read_bytes()).hexdigest()
+
+
+def test_deleted_manual_markdown_is_removed_from_manifest(tree):
+    src, dst = tree
+    manual = dst / "notes.md"
+    dst.mkdir()
+    manual.write_text("# Notes\n", "utf-8")
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.execute(syncer.plan())
+
+    manual.unlink()
+    plan = syncer.plan()
+    assert [(item.rel_path, item.action) for item in plan.manual] == [
+        ("notes.md", ManualAction.REMOVED)
+    ]
+    syncer.execute(plan)
+    assert "notes.md" not in syncer.manifest.entries
+
+
+def test_manual_entries_are_maintained_and_kept_when_adoption_is_disabled(tree):
+    src, dst = tree
+    manual = dst / "notes.md"
+    dst.mkdir()
+    manual.write_text("# Notes\n", "utf-8")
+    Syncer(src, dst, FakeConverter()).sync()
+
+    manual.write_text("# Updated notes\n", "utf-8")
+    syncer = Syncer(src, dst, FakeConverter(), adopt=False)
+    plan = syncer.plan()
+    assert [(item.rel_path, item.action) for item in plan.manual] == [
+        ("notes.md", ManualAction.CHANGED)
+    ]
+    assert plan.orphans == []
+    syncer.execute(plan, prune=True)
+    assert syncer.manifest.entries["notes.md"].fingerprint == hashlib.sha256(manual.read_bytes()).hexdigest()
+    assert manual.exists()
+
+
+def test_renamed_manual_markdown_is_rekeyed(tree):
+    src, dst = tree
+    old = dst / "notes.md"
+    dst.mkdir()
+    old.write_text("# Notes\n", "utf-8")
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.execute(syncer.plan())
+    previous = syncer.manifest.entries["notes.md"]
+
+    new = dst / "renamed.md"
+    old.rename(new)
+    plan = syncer.plan()
+    assert [(item.rel_path, item.action, item.moved_from) for item in plan.manual] == [
+        ("renamed.md", ManualAction.MOVED, "notes.md")
+    ]
+    syncer.execute(plan)
+    assert "notes.md" not in syncer.manifest.entries
+    moved = syncer.manifest.entries["renamed.md"]
+    assert moved.fingerprint == previous.fingerprint
+    assert moved.md_sha256 == previous.md_sha256
+    assert moved.generated_at == previous.generated_at
+
+
+def test_vanished_source_output_remains_an_orphan(tree):
+    src, dst = tree
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.sync()
+    (src / "root.pdf").unlink()
+
+    plan = Syncer(src, dst, FakeConverter()).plan()
+    assert [path.relative_to(dst).as_posix() for path in plan.orphans] == ["root.md"]
+    assert plan.manual == []
+
+
+def test_unknown_markdown_collision_is_not_overwritten(tree):
+    src, dst = tree
+    dst.mkdir()
+    output = dst / "root.md"
+    output.write_text("# Hand-written\n", "utf-8")
+
+    syncer = Syncer(src, dst, FakeConverter())
+    plan = syncer.plan()
+    assert "root.pdf" in plan.errors
+    assert "output root.md is a manual Markdown file" == plan.errors["root.pdf"]
+    assert all(item.rel_path != "root.pdf" for item in plan.to_generate)
+    syncer.execute(plan)
+    assert output.read_text("utf-8") == "# Hand-written\n"
+
+
+def test_source_output_cannot_collide_with_adopted_manual_markdown(tree):
+    src, dst = tree
+    manual = dst / "newdoc.md"
+    dst.mkdir()
+    manual.write_text("# Hand-written\n", "utf-8")
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.execute(syncer.plan())
+
+    (src / "newdoc.pdf").write_bytes(b"new source")
+    plan = syncer.plan()
+    assert plan.errors["newdoc.pdf"] == "output newdoc.md is a manual Markdown file"
+    assert all(item.rel_path != "newdoc.pdf" for item in plan.to_generate)
+    syncer.execute(plan)
+    assert manual.read_text("utf-8") == "# Hand-written\n"
+
+
+def test_hand_edited_generated_markdown_is_protected(tree):
+    src, dst = tree
+    conv = FakeConverter()
+    Syncer(src, dst, conv).sync()
+    output = dst / "root.md"
+    output.write_text("# My edit\n", "utf-8")
+    (src / "root.pdf").write_bytes(b"root v2")
+    syncer = Syncer(src, dst, conv)
+
+    plan = syncer.plan()
+    assert plan.edited == ["root.pdf"]
+    assert all(item.rel_path != "root.pdf" for item in plan.to_generate)
+    syncer.execute(plan)
+    assert output.read_text("utf-8") == "# My edit\n"
+
+    forced = syncer.plan(force=True)
+    assert forced.edited == ["root.pdf"]
+    assert all(item.rel_path != "root.pdf" for item in forced.to_generate)
+
+    overwrite = syncer.plan(overwrite_edited=True)
+    assert overwrite.edited == []
+    assert [(item.rel_path, item.reason) for item in overwrite.to_generate] == [
+        ("root.pdf", Reason.CHANGED)
+    ]
+    syncer.execute(overwrite)
+    assert output.read_text("utf-8") != "# My edit\n"
+
+    output.write_text("# Selected edit\n", "utf-8")
+    selected = syncer.plan(select=["root.pdf"])
+    assert selected.edited == []
+    assert [(item.rel_path, item.reason) for item in selected.to_generate] == [
+        ("root.pdf", Reason.FORCED)
+    ]
+    syncer.execute(selected)
+    assert output.read_text("utf-8") != "# Selected edit\n"
+
+
+def test_old_manifest_markdown_hash_is_backfilled(tree):
+    src, dst = tree
+    Syncer(src, dst, FakeConverter()).sync()
+    manifest_path = dst / MANIFEST_NAME
+    data = json.loads(manifest_path.read_text("utf-8"))
+    for entry in data["files"].values():
+        entry.pop("md_sha256")
+    manifest_path.write_text(json.dumps(data), "utf-8")
+
+    syncer = Syncer(src, dst, FakeConverter())
+    plan = syncer.plan()
+    assert plan.to_generate == []
+    assert all(syncer.manifest.entries[rel].md_sha256 is not None for rel in plan.up_to_date)
+    syncer.execute(plan)
+    saved = json.loads(manifest_path.read_text("utf-8"))["files"]
+    for rel, entry in saved.items():
+        output = dst / entry["output"]
+        assert entry["md_sha256"] == hashlib.sha256(output.read_bytes()).hexdigest()

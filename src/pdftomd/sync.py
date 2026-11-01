@@ -21,6 +21,10 @@ entries are always skipped.
 
 Conversion runs in a thread pool (``workers``); manifest updates and callbacks
 happen on the calling thread.
+
+Hand-written Markdown in the destination is adopted into the manifest by
+default and is never pruned. Generated Markdown edited by hand is protected
+from regeneration unless explicitly selected or ``overwrite_edited`` is set.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ if TYPE_CHECKING:  # pragma: no cover
 MANIFEST_NAME = ".pdftomd-manifest.json"
 MANIFEST_VERSION = 2
 _GDRIVE_ENGINE = "gdrive"  # recorded when Drive exported Markdown directly (no engine involved)
+MANUAL_ENGINE = "manual"
 
 
 class Reason(str, Enum):
@@ -53,6 +58,20 @@ class Reason(str, Enum):
     OUTPUT_MISSING = "output-missing"
     FORCED = "forced"
     MOVED = "moved"
+
+
+class ManualAction(str, Enum):
+    ADOPTED = "adopted"
+    CHANGED = "manual-changed"
+    MOVED = "manual-moved"
+    REMOVED = "manual-removed"
+
+
+@dataclass(frozen=True)
+class ManualItem:
+    rel_path: str
+    action: ManualAction
+    moved_from: str | None = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +91,8 @@ class SyncPlan:
     excluded: list[str] = field(default_factory=list)  # source files/dirs skipped by exclude patterns
     orphans: list[Path] = field(default_factory=list)  # destination files without a source
     errors: dict[str, str] = field(default_factory=dict)  # files whose state could not be determined
+    manual: list[ManualItem] = field(default_factory=list)
+    edited: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -80,6 +101,7 @@ class SyncResult:
     moved: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     pruned: list[str] = field(default_factory=list)
+    manual: list[ManualItem] = field(default_factory=list)
 
 
 @dataclass
@@ -90,6 +112,7 @@ class ManifestEntry:
     engine: str
     output: str
     generated_at: float
+    md_sha256: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "ManifestEntry":
@@ -150,6 +173,7 @@ class Syncer:
         follow_symlinks: bool = False,
         exclude_name: Iterable[str] | None = None,
         exclude_path: Iterable[str] | None = None,
+        adopt: bool = True,
     ) -> None:
         self.source_dir = Path(source_dir).resolve()
         self.dest_dir = Path(dest_dir).resolve()
@@ -166,6 +190,7 @@ class Syncer:
         self.follow_symlinks = follow_symlinks
         self.exclude_name = _compile(exclude_name)
         self.exclude_path = _compile(exclude_path)
+        self.adopt = adopt
         self.manifest = Manifest(self.dest_dir / MANIFEST_NAME)
 
     def _excluded(self, name: str, rel: str, is_dir: bool) -> bool:
@@ -207,7 +232,13 @@ class Syncer:
 
     # -- planning ------------------------------------------------------------
 
-    def plan(self, *, force: bool = False, select: Iterable[str | Path] | None = None) -> SyncPlan:
+    def plan(
+        self,
+        *,
+        force: bool = False,
+        select: Iterable[str | Path] | None = None,
+        overwrite_edited: bool = False,
+    ) -> SyncPlan:
         """Compute what would be (re)generated. Never touches the filesystem.
 
         ``select`` restricts the plan to the given source paths (relative to
@@ -229,6 +260,18 @@ class Syncer:
             seen_sources.add(rel)
             seen_outputs.add(out_rel)
             dest = self.dest_dir / out_rel
+            entry = self.manifest.entries.get(rel)
+            if any(
+                manifest_entry.engine == MANUAL_ENGINE and manifest_entry.output == out_rel
+                for manifest_entry in self.manifest.entries.values()
+            ):
+                plan.errors[rel] = f"output {out_rel} is a manual Markdown file"
+                continue
+            if dest.is_file() and not any(
+                manifest_entry.output == out_rel for manifest_entry in self.manifest.entries.values()
+            ):
+                plan.errors[rel] = f"output {out_rel} is a manual Markdown file"
+                continue
             if selected is not None:
                 if rel in selected:
                     plan.to_generate.append(PlannedItem(rel, src, dest, Reason.FORCED))
@@ -239,7 +282,18 @@ class Syncer:
                 plan.errors[rel] = str(exc)
                 continue
             if reason is None:
+                if entry is not None and entry.md_sha256 is None and dest.is_file():
+                    entry.md_sha256 = file_sha256(dest)
                 plan.up_to_date.append(rel)
+            elif (
+                reason in {Reason.CHANGED, Reason.ENGINE_CHANGED, Reason.FORCED}
+                and entry is not None
+                and entry.md_sha256 is not None
+                and dest.is_file()
+                and file_sha256(dest) != entry.md_sha256
+                and not overwrite_edited
+            ):
+                plan.edited.append(rel)
             else:
                 plan.to_generate.append(PlannedItem(rel, src, dest, reason))
 
@@ -254,13 +308,66 @@ class Syncer:
         moved_outputs = self._detect_moves(plan, seen_sources)
 
         if self.dest_dir.is_dir():
+            destination_markdown: list[tuple[str, Path]] = []
             for root, dirs, files in os.walk(self.dest_dir):
                 dirs[:] = [d for d in dirs if not d.startswith(".")]
                 for name in files:
                     p = Path(root) / name
                     rel_out = p.relative_to(self.dest_dir).as_posix()
-                    if p.suffix.lower() == ".md" and rel_out not in seen_outputs and rel_out not in moved_outputs:
-                        plan.orphans.append(p)
+                    if p.suffix.lower() == ".md" and not name.startswith("."):
+                        destination_markdown.append((rel_out, p))
+            claimed = seen_outputs | moved_outputs | {e.output for e in self.manifest.entries.values()}
+            unknown = [(rel, path) for rel, path in sorted(destination_markdown) if rel not in claimed]
+            matched_unknown: set[int] = set()
+            orphan_outputs = {
+                entry.output
+                for entry in self.manifest.entries.values()
+                if entry.engine != MANUAL_ENGINE and entry.output not in seen_outputs and entry.output not in moved_outputs
+            }
+            plan.orphans.extend(path for rel, path in destination_markdown if rel in orphan_outputs)
+
+            if selected is None:
+                manual_entries = {
+                    rel: entry
+                    for rel, entry in self.manifest.entries.items()
+                    if entry.engine == MANUAL_ENGINE
+                }
+                candidate_hashes: dict[int, str] = {}
+                for old_rel, entry in manual_entries.items():
+                    path = self.dest_dir / entry.output
+                    if path.is_file():
+                        st = path.stat()
+                        if st.st_size == entry.size and st.st_mtime == entry.mtime:
+                            continue
+                        fingerprint = file_sha256(path)
+                        if fingerprint == entry.fingerprint:
+                            entry.size, entry.mtime = st.st_size, st.st_mtime
+                        else:
+                            plan.manual.append(ManualItem(entry.output, ManualAction.CHANGED))
+                        continue
+                    match_index = None
+                    for index, (_, candidate) in enumerate(unknown):
+                        if index in matched_unknown:
+                            continue
+                        if index not in candidate_hashes:
+                            candidate_hashes[index] = file_sha256(candidate)
+                        if candidate_hashes[index] == entry.fingerprint:
+                            match_index = index
+                            break
+                    if match_index is None:
+                        plan.manual.append(ManualItem(entry.output, ManualAction.REMOVED))
+                    else:
+                        new_rel, _ = unknown[match_index]
+                        matched_unknown.add(match_index)
+                        plan.manual.append(ManualItem(new_rel, ManualAction.MOVED, entry.output))
+
+            for index, (rel_out, path) in enumerate(unknown):
+                if index in matched_unknown:
+                    continue
+                if selected is None and self.adopt:
+                    plan.manual.append(ManualItem(rel_out, ManualAction.ADOPTED))
+                else:
+                    plan.orphans.append(path)
         return plan
 
     def _detect_moves(self, plan: SyncPlan, seen_sources: set[str]) -> set[str]:
@@ -278,6 +385,8 @@ class Syncer:
         vanished: dict[tuple[str, str], list[str]] = {}
         sizes: set[int] = set()
         for rel, entry in self.manifest.entries.items():
+            if entry.engine == MANUAL_ENGINE:
+                continue
             if rel in seen_sources or not (self.dest_dir / entry.output).is_file():
                 continue
             vanished.setdefault((entry.engine, entry.fingerprint), []).append(rel)
@@ -362,7 +471,7 @@ class Syncer:
         """Worker count actually used: ``max(1, workers)``, or 1 when the converter is not ``parallel_safe``."""
         return max(1, workers) if self.converter.parallel_safe else 1
 
-    def _convert_item(self, item: PlannedItem) -> tuple[os.stat_result, str, str, float]:
+    def _convert_item(self, item: PlannedItem) -> tuple[os.stat_result, str, str, str | None, float]:
         """Worker: convert one item and write its .md via tmp + os.replace. Runs in the pool.
 
         MOVED items are not converted: the previous Markdown is relocated.
@@ -373,13 +482,41 @@ class Syncer:
             previous = self.manifest.entries[item.moved_from]
             item.destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(self.dest_dir / previous.output, item.destination)
-            return st, previous.fingerprint, previous.engine, time.monotonic() - started
+            return st, previous.fingerprint, previous.engine, previous.md_sha256, time.monotonic() - started
         markdown, fingerprint, engine = self._produce(item.source)
         item.destination.parent.mkdir(parents=True, exist_ok=True)
         tmp = item.destination.with_name(item.destination.name + ".tmp")
         tmp.write_text(markdown, "utf-8")
         os.replace(tmp, item.destination)
-        return st, fingerprint, engine, time.monotonic() - started
+        md_sha256 = hashlib.sha256(markdown.encode("utf-8")).hexdigest()
+        return st, fingerprint, engine, md_sha256, time.monotonic() - started
+
+    def _apply_manual_item(self, item: ManualItem) -> None:
+        if item.action is ManualAction.REMOVED:
+            self.manifest.entries.pop(item.rel_path, None)
+            return
+        if item.action is ManualAction.MOVED:
+            previous = self.manifest.entries.pop(item.moved_from)
+            generated_at = previous.generated_at
+        elif item.action is ManualAction.CHANGED:
+            previous = self.manifest.entries[item.rel_path]
+            generated_at = previous.generated_at
+        else:
+            generated_at = time.time()
+        path = self.dest_dir / item.rel_path
+        if not path.is_file():
+            return
+        st = path.stat()
+        fingerprint = file_sha256(path)
+        self.manifest.entries[item.rel_path] = ManifestEntry(
+            fingerprint=fingerprint,
+            size=st.st_size,
+            mtime=st.st_mtime,
+            engine=MANUAL_ENGINE,
+            output=item.rel_path,
+            generated_at=generated_at,
+            md_sha256=fingerprint,
+        )
 
     def execute(
         self,
@@ -427,7 +564,7 @@ class Syncer:
                         if on_error:
                             on_error(item, exc)
                         continue
-                    st, fingerprint, engine, elapsed = fut.result()
+                    st, fingerprint, engine, md_sha256, elapsed = fut.result()
                     generated_at = time.time()
                     if item.reason is Reason.MOVED:
                         generated_at = self.manifest.entries[item.moved_from].generated_at
@@ -442,6 +579,7 @@ class Syncer:
                         engine=engine,
                         output=item.destination.relative_to(self.dest_dir).as_posix(),
                         generated_at=generated_at,
+                        md_sha256=md_sha256,
                     )
                     self.manifest.save()  # persist after each file so a crash loses nothing
                     done_index += 1
@@ -453,13 +591,17 @@ class Syncer:
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
+        for item in plan.manual:
+            self._apply_manual_item(item)
+            result.manual.append(item)
+
         if prune:
             for orphan in plan.orphans:
                 orphan.unlink(missing_ok=True)
                 result.pruned.append(orphan.relative_to(self.dest_dir).as_posix())
             live = {rel for rel, _ in self.iter_source_files()}
             for rel in list(self.manifest.entries):
-                if rel not in live:
+                if rel not in live and self.manifest.entries[rel].engine != MANUAL_ENGINE:
                     del self.manifest.entries[rel]
         if prune or result.moved:
             self._remove_empty_dirs()
@@ -482,8 +624,14 @@ class Syncer:
         *,
         force: bool = False,
         select: Iterable[str | Path] | None = None,
+        overwrite_edited: bool = False,
         prune: bool = False,
         workers: int = 5,
         **callbacks,
     ) -> SyncResult:
-        return self.execute(self.plan(force=force, select=select), prune=prune, workers=workers, **callbacks)
+        return self.execute(
+            self.plan(force=force, select=select, overwrite_edited=overwrite_edited),
+            prune=prune,
+            workers=workers,
+            **callbacks,
+        )

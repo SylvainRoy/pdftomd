@@ -11,7 +11,7 @@ import typer
 from . import __version__
 from .converters import ENGINES, ConversionError, get_converter
 from .converters.gemini import DEFAULT_MODEL
-from .sync import PlannedItem, Reason, Syncer, SyncPlan
+from .sync import ManualAction, PlannedItem, Reason, Syncer, SyncPlan
 
 app = typer.Typer(
     help="Convert documents (PDF, scans, Google Docs, ...) to Markdown. One-way, incremental, source is never modified.",
@@ -38,6 +38,12 @@ GDrive = typer.Option(
     help="Fetch .gdoc/.gsheet/.gslides stubs from Google Drive. Default: on when logged in (`pdftomd gdrive login`).",
     show_default=False,
 )
+Adopt = typer.Option(
+    True,
+    "--adopt/--no-adopt",
+    help="Register hand-written .md files of the destination in the manifest (engine 'manual').",
+)
+OverwriteEdited = typer.Option(False, "--overwrite-edited", help="Regenerate outputs even if their .md was edited by hand.")
 
 
 def _converter(engine: str, force_ocr: bool, use_llm: bool, langs: Optional[list[str]], model: str, api_key: Optional[str], timeout: float = 300.0):
@@ -71,9 +77,17 @@ def _resolver(enabled: Optional[bool], describer=None):
     return gdrive.GoogleDriveResolver(describer=describer)
 
 
-def _syncer(source: Path, dest: Path, conv, gdrive, exclude_name: Optional[list[str]], exclude_path: Optional[list[str]]) -> Syncer:
+def _syncer(
+    source: Path,
+    dest: Path,
+    conv,
+    gdrive,
+    exclude_name: Optional[list[str]],
+    exclude_path: Optional[list[str]],
+    adopt: bool = True,
+) -> Syncer:
     try:
-        return Syncer(source, dest, conv, gdrive=gdrive, exclude_name=exclude_name, exclude_path=exclude_path)
+        return Syncer(source, dest, conv, gdrive=gdrive, exclude_name=exclude_name, exclude_path=exclude_path, adopt=adopt)
     except ValueError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(2)
@@ -94,13 +108,21 @@ def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
             typer.echo(f"[      excluded] {rel}")
     for orphan in plan.orphans:
         typer.echo(f"[        orphan] {orphan}")
+    for item in plan.manual:
+        if item.action is ManualAction.MOVED:
+            typer.echo(f"[{item.action.value:>14}] {item.moved_from} -> {item.rel_path}")
+        else:
+            typer.echo(f"[{item.action.value:>14}] {item.rel_path}")
+    for rel in plan.edited:
+        typer.echo(f"[        edited] {rel}")
     for rel, msg in plan.errors.items():
         typer.secho(f"[         error] {rel}: {msg}", fg=typer.colors.RED)
     moved = sum(1 for i in plan.to_generate if i.reason is Reason.MOVED)
     typer.echo(
         f"-- {len(plan.to_generate) - moved} to generate, {moved} to move, {len(plan.up_to_date)} up to date, "
         f"{len(plan.unsupported)} unsupported, {len(plan.excluded)} excluded, "
-        f"{len(plan.orphans)} orphan output(s), {len(plan.errors)} error(s)",
+        f"{len(plan.orphans)} orphan output(s), {len(plan.manual)} manual, {len(plan.edited)} edited, "
+        f"{len(plan.errors)} error(s)",
         err=True,
     )
 
@@ -119,7 +141,8 @@ def _run(syncer: Syncer, plan: SyncPlan, prune: bool, workers: int) -> int:
         typer.echo(f"-- converting with {eff} workers", err=True)
     result = syncer.execute(plan, prune=prune, workers=workers, on_done=done, on_error=error)
     typer.echo(
-        f"-- generated {len(result.generated)}, moved {len(result.moved)}, failed {len(result.failed)}, pruned {len(result.pruned)}",
+        f"-- generated {len(result.generated)}, moved {len(result.moved)}, failed {len(result.failed)}, "
+        f"pruned {len(result.pruned)}, manual {len(result.manual)}",
         err=True,
     )
     return 1 if result.failed else 0
@@ -149,6 +172,8 @@ def sync(
     workers: int = Workers,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
     use_gdrive: Optional[bool] = GDrive,
+    adopt: bool = Adopt,
+    overwrite_edited: bool = OverwriteEdited,
     force_ocr: bool = ForceOcr,
     use_llm: bool = UseLlm,
     lang: Optional[list[str]] = Langs,
@@ -158,9 +183,12 @@ def sync(
 ) -> None:
     """Synchronise SOURCE into DEST, regenerating only stale Markdown files."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
-    syncer = _syncer(source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)), exclude_name, exclude_path)
+    syncer = _syncer(
+        source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)),
+        exclude_name, exclude_path, adopt,
+    )
     try:
-        plan = syncer.plan(force=force, select=select or None)
+        plan = syncer.plan(force=force, select=select or None, overwrite_edited=overwrite_edited)
     except FileNotFoundError as exc:
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(2)
@@ -179,10 +207,11 @@ def list_cmd(
     exclude_path: Optional[list[str]] = ExcludePath,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
     use_gdrive: Optional[bool] = GDrive,
+    adopt: bool = Adopt,
 ) -> None:
     """List the documents that would be (re)generated, without converting anything."""
     conv = _converter(engine, False, False, None, DEFAULT_MODEL, None)
-    plan = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path).plan()
+    plan = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path, adopt).plan()
     _print_plan(plan, verbose=verbose)
     raise typer.Exit(1 if plan.errors else 0)
 
@@ -238,15 +267,20 @@ def watch(
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
     gemini_timeout: float = GeminiTimeout,
+    adopt: bool = Adopt,
+    overwrite_edited: bool = OverwriteEdited,
 ) -> None:
     """Keep DEST in sync with SOURCE, re-scanning periodically until interrupted."""
     conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
-    syncer = _syncer(source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)), exclude_name, exclude_path)
+    syncer = _syncer(
+        source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)),
+        exclude_name, exclude_path, adopt,
+    )
     typer.echo(f"watching {syncer.source_dir} every {interval:g}s (Ctrl-C to stop)", err=True)
     try:
         while True:
-            plan = syncer.plan()
-            if plan.to_generate or plan.errors or (prune and plan.orphans):
+            plan = syncer.plan(overwrite_edited=overwrite_edited)
+            if plan.to_generate or plan.errors or plan.manual or (prune and plan.orphans):
                 _run(syncer, plan, prune, workers)
             time.sleep(interval)
     except KeyboardInterrupt:
