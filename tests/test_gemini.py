@@ -151,6 +151,16 @@ def test_long_pdf_uses_ordered_page_chunks(monkeypatch):
     assert page_counts == [5, 5, 2]
 
 
+def test_unparseable_pdf_skips_chunk_attempt(monkeypatch):
+    blocked = _response("partial", finish_reason="RECITATION")
+    conv = _converter(monkeypatch, [blocked, blocked])
+
+    with pytest.raises(GeminiNoTextError, match="Gemini returned no usable text after 2 attempt\\(s\\)"):
+        conv.convert_bytes(b"not a pdf", filename="bad.pdf")
+
+    assert len(conv._client.models.calls) == 2
+
+
 def test_all_attempts_fail_with_labels_and_diagnostics(monkeypatch):
     blocked = _response("partial", finish_reason="RECITATION")
     conv = _converter(

@@ -275,13 +275,16 @@ class GeminiConverter(Converter):
         return "\n\n".join(output)
 
     def _pdf_page_count(self, data: bytes) -> int:
-        import pypdfium2 as pdfium
-
-        document = pdfium.PdfDocument(data)
         try:
-            return len(document)
-        finally:
-            document.close()
+            import pypdfium2 as pdfium
+
+            document = pdfium.PdfDocument(data)
+            try:
+                return len(document)
+            finally:
+                document.close()
+        except Exception:
+            return 0
 
     def _iter_pdf_chunks(self, data: bytes) -> Iterator[tuple[int, int, bytes]]:
         import pypdfium2 as pdfium
