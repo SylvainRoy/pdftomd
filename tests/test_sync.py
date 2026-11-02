@@ -12,6 +12,7 @@ import pytest
 
 from pdftomd import MANIFEST_NAME, MANUAL_ENGINE, ManualAction, Reason, Syncer
 from pdftomd.converters.base import ConversionError, Converter
+from pdftomd.sync import _GDRIVE_ENGINE
 
 
 class FakeConverter(Converter):
@@ -161,6 +162,116 @@ def test_missing_output_is_regenerated(tree):
     assert [(i.rel_path, i.reason) for i in plan.to_generate] == [("root.pdf", Reason.OUTPUT_MISSING)]
 
 
+def test_existing_empty_output_is_regenerated_and_hash_updated(tree):
+    src, dst = tree
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.sync()
+    output = dst / "root.md"
+    output.write_text("\n", "utf-8")
+
+    plan = syncer.plan()
+    assert [(item.rel_path, item.reason) for item in plan.to_generate] == [
+        ("root.pdf", Reason.OUTPUT_EMPTY)
+    ]
+    result = syncer.execute(plan)
+
+    assert result.generated == ["root.pdf"]
+    assert output.read_text("utf-8").startswith("# root.pdf")
+    assert syncer.manifest.entries["root.pdf"].md_sha256 == hashlib.sha256(output.read_bytes()).hexdigest()
+
+
+def test_whitespace_only_existing_output_is_empty(tree):
+    src, dst = tree
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.sync()
+    (dst / "root.md").write_text(" \t\n　\n", "utf-8")
+
+    plan = syncer.plan()
+    assert [(item.rel_path, item.reason) for item in plan.to_generate] == [
+        ("root.pdf", Reason.OUTPUT_EMPTY)
+    ]
+
+
+def test_existing_output_above_threshold_remains_up_to_date(tree):
+    src, dst = tree
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.sync()
+    (dst / "root.md").write_text("0123456789", "utf-8")
+
+    plan = syncer.plan()
+    assert "root.pdf" in plan.up_to_date
+    assert all(item.rel_path != "root.pdf" for item in plan.to_generate)
+
+
+def test_min_chars_zero_disables_existing_output_scan(tree):
+    src, dst = tree
+    syncer = Syncer(src, dst, FakeConverter(), min_chars=0)
+    syncer.sync()
+    (dst / "root.md").write_text("\n", "utf-8")
+
+    plan = syncer.plan()
+    assert "root.pdf" in plan.up_to_date
+    assert all(item.rel_path != "root.pdf" for item in plan.to_generate)
+
+
+def test_drive_and_manual_outputs_are_exempt_from_empty_scan(tree):
+    src, dst = tree
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.sync()
+    output = dst / "root.md"
+    output.write_text("\n", "utf-8")
+    entry = syncer.manifest.entries["root.pdf"]
+
+    entry.engine = _GDRIVE_ENGINE
+    assert not syncer._is_empty_output(entry, output)
+    entry.engine = MANUAL_ENGINE
+    assert not syncer._is_empty_output(entry, output)
+
+
+def test_edited_tiny_output_is_regenerated_not_protected(tree):
+    src, dst = tree
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.sync()
+    (dst / "root.md").write_text("x", "utf-8")
+
+    plan = syncer.plan()
+
+    assert plan.edited == []
+    assert [(item.rel_path, item.reason) for item in plan.to_generate] == [
+        ("root.pdf", Reason.OUTPUT_EMPTY)
+    ]
+
+
+def test_failed_empty_output_is_deleted_and_retried_as_new(tree):
+    src, dst = tree
+    Syncer(src, dst, FakeConverter()).sync()
+    output = dst / "root.md"
+    output.write_text("\n", "utf-8")
+    syncer = Syncer(src, dst, FakeConverter(fail_on={"root.pdf"}))
+    plan = syncer.plan()
+    assert plan.to_generate[0].reason is Reason.OUTPUT_EMPTY
+
+    result = syncer.execute(plan)
+
+    assert "root.pdf" in result.failed
+    assert result.removed_empty == ["root.md"]
+    assert not output.exists()
+    assert "root.pdf" not in syncer.manifest.entries
+    assert syncer.plan().to_generate[0].reason is Reason.NEW
+
+
+def test_large_whitespace_output_is_not_scanned(tree):
+    src, dst = tree
+    syncer = Syncer(src, dst, FakeConverter())
+    syncer.sync()
+    (dst / "root.md").write_text(" " * 5000, "utf-8")
+
+    plan = syncer.plan()
+
+    assert "root.pdf" in plan.up_to_date
+    assert all(item.rel_path != "root.pdf" for item in plan.to_generate)
+
+
 def test_engine_change_is_regenerated(tree):
     src, dst = tree
     Syncer(src, dst, FakeConverter()).sync()
@@ -186,6 +297,12 @@ def test_force_and_select(tree):
 
     plan = Syncer(src, dst, conv).plan(select=[src / "a" / "b" / "two.png"])  # absolute works too
     assert [i.rel_path for i in plan.to_generate] == ["a/b/two.png"]
+
+    (dst / "root.md").write_text("\n", "utf-8")
+    selected_empty = Syncer(src, dst, conv).plan(select=["root.pdf"])
+    assert [(i.rel_path, i.reason) for i in selected_empty.to_generate] == [
+        ("root.pdf", Reason.OUTPUT_EMPTY)
+    ]
 
     with pytest.raises(FileNotFoundError):
         Syncer(src, dst, conv).plan(select=["nope.pdf"])
@@ -247,6 +364,7 @@ def test_empty_changed_conversion_preserves_existing_markdown(tree):
     result = syncer.sync()
 
     assert set(result.failed) == {"root.pdf"}
+    assert result.removed_empty == []
     assert (dst / "root.md").read_text() == previous_markdown
     manifest = json.loads((dst / MANIFEST_NAME).read_text())
     assert manifest["files"]["root.pdf"] == previous_entry
@@ -798,7 +916,7 @@ def test_hand_edited_generated_markdown_is_protected(tree):
     conv = FakeConverter()
     Syncer(src, dst, conv).sync()
     output = dst / "root.md"
-    output.write_text("# My edit\n", "utf-8")
+    output.write_text("# My longer hand edit\n", "utf-8")
     (src / "root.pdf").write_bytes(b"root v2")
     syncer = Syncer(src, dst, conv)
 
@@ -806,7 +924,7 @@ def test_hand_edited_generated_markdown_is_protected(tree):
     assert plan.edited == ["root.pdf"]
     assert all(item.rel_path != "root.pdf" for item in plan.to_generate)
     syncer.execute(plan)
-    assert output.read_text("utf-8") == "# My edit\n"
+    assert output.read_text("utf-8") == "# My longer hand edit\n"
 
     forced = syncer.plan(force=True)
     assert forced.edited == ["root.pdf"]

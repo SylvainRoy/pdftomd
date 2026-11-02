@@ -55,6 +55,34 @@ def test_sync_then_list_then_select(tree, fake_engine):
     assert res.exit_code == 2
 
 
+def test_dry_run_reports_empty_output_and_list_uses_min_chars(tree, fake_engine):
+    src, dst = tree
+    assert runner.invoke(cli.app, ["sync", str(src), str(dst)]).exit_code == 0
+    (dst / "a.md").write_text("\n", "utf-8")
+
+    dry_run = runner.invoke(cli.app, ["sync", str(src), str(dst), "--dry-run"])
+    assert dry_run.exit_code == 0, dry_run.output
+    assert "output-empty] a.pdf" in dry_run.output
+
+    listed = runner.invoke(cli.app, ["list", str(src), str(dst), "--min-chars", "0", "-v"])
+    assert listed.exit_code == 0, listed.output
+    assert "[    up-to-date] a.pdf" in listed.output
+
+
+def test_sync_reports_deleted_empty_output(tree, fake_engine):
+    src, dst = tree
+    assert runner.invoke(cli.app, ["sync", str(src), str(dst)]).exit_code == 0
+    (dst / "a.md").write_text("\n", "utf-8")
+    fake_engine.fail_on.add("a.pdf")
+
+    result = runner.invoke(cli.app, ["sync", str(src), str(dst)])
+
+    assert result.exit_code == 1
+    assert "removed empty output a.md" in result.output
+    assert "removed-empty 1" in result.output
+    assert not (dst / "a.md").exists()
+
+
 def test_list_adoption_flags_and_overwrite_edited_option(tree, fake_engine):
     src, dst = tree
     dst.mkdir()

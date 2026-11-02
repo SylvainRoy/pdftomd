@@ -9,6 +9,7 @@ file. A source file is (re)generated when any of the following holds:
   local files, remote version for Google Drive stubs),
 * the recorded engine differs from the engine in use,
 * the destination Markdown file is missing,
+* the destination is an engine-generated output below the minimum content threshold,
 * it was explicitly selected / ``force`` was requested.
 
 A new source file whose fingerprint matches a manifest entry whose own source
@@ -23,7 +24,8 @@ Conversion runs in a thread pool (``workers``); manifest updates and callbacks
 happen on the calling thread.
 
 Engine-produced Markdown is checked for minimum non-whitespace content before
-it is written; Markdown exported directly by Google Drive is not checked.
+it is written; Markdown exported directly by Google Drive is not checked. A
+tiny existing output is also reconverted and deleted if that regeneration fails.
 
 Hand-written Markdown in the destination is adopted into the manifest by
 default and is never pruned. Generated Markdown edited by hand is protected
@@ -52,6 +54,7 @@ MANIFEST_NAME = ".pdftomd-manifest.json"
 MANIFEST_VERSION = 2
 _GDRIVE_ENGINE = "gdrive"  # recorded when Drive exported Markdown directly (no engine involved)
 MANUAL_ENGINE = "manual"
+_EMPTY_SCAN_BYTES = 4096
 
 
 class Reason(str, Enum):
@@ -59,6 +62,7 @@ class Reason(str, Enum):
     CHANGED = "changed"
     ENGINE_CHANGED = "engine-changed"
     OUTPUT_MISSING = "output-missing"
+    OUTPUT_EMPTY = "output-empty"
     FORCED = "forced"
     MOVED = "moved"
 
@@ -104,6 +108,7 @@ class SyncResult:
     moved: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
     pruned: list[str] = field(default_factory=list)
+    removed_empty: list[str] = field(default_factory=list)
     manual: list[ManualItem] = field(default_factory=list)
 
 
@@ -276,7 +281,8 @@ class Syncer:
                 continue
             if selected is not None:
                 if rel in selected:
-                    plan.to_generate.append(PlannedItem(rel, src, dest, Reason.FORCED))
+                    reason = Reason.OUTPUT_EMPTY if self._is_empty_output(entry, dest) else Reason.FORCED
+                    plan.to_generate.append(PlannedItem(rel, src, dest, reason))
                 continue
             try:
                 reason = Reason.FORCED if force else self._staleness(rel, src, dest)
@@ -438,6 +444,8 @@ class Syncer:
                 return Reason.NEW
             if not dest.exists():
                 return Reason.OUTPUT_MISSING
+            if self._is_empty_output(entry, dest):
+                return Reason.OUTPUT_EMPTY
             expected_engine = self.converter.name if info.needs_engine else _GDRIVE_ENGINE
             if entry.engine != expected_engine:
                 return Reason.ENGINE_CHANGED
@@ -446,6 +454,8 @@ class Syncer:
             return Reason.NEW
         if not dest.exists():
             return Reason.OUTPUT_MISSING
+        if self._is_empty_output(entry, dest):
+            return Reason.OUTPUT_EMPTY
         if entry.engine != self.converter.name:
             return Reason.ENGINE_CHANGED
         st = src.stat()
@@ -457,6 +467,19 @@ class Syncer:
         # Same content, only metadata changed: refresh the recorded metadata.
         entry.size, entry.mtime = st.st_size, st.st_mtime
         return None
+
+    def _is_empty_output(self, entry: ManifestEntry | None, dest: Path) -> bool:
+        if (
+            self.min_chars <= 0
+            or entry is None
+            or entry.engine in {_GDRIVE_ENGINE, MANUAL_ENGINE}
+            or not dest.is_file()
+        ):
+            return False
+        if dest.stat().st_size > _EMPTY_SCAN_BYTES:
+            return False
+        text = dest.read_text("utf-8", errors="replace")
+        return len("".join(text.split())) < self.min_chars
 
     def _produce(self, src: Path) -> tuple[str, str, str]:
         """Return (markdown, fingerprint, engine) for a source file."""
@@ -572,6 +595,13 @@ class Syncer:
                         if not isinstance(exc, (ConversionError, OSError)):
                             raise exc
                         result.failed[item.rel_path] = str(exc)
+                        if item.reason is Reason.OUTPUT_EMPTY:
+                            item.destination.unlink(missing_ok=True)
+                            self.manifest.entries.pop(item.rel_path, None)
+                            self.manifest.save()
+                            result.removed_empty.append(
+                                item.destination.relative_to(self.dest_dir).as_posix()
+                            )
                         if on_error:
                             on_error(item, exc)
                         continue

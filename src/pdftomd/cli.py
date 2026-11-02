@@ -188,9 +188,11 @@ def _run(syncer: Syncer, plan: SyncPlan, prune: bool, workers: int) -> int:
     elif eff > 1 and plan.to_generate:
         typer.echo(f"-- converting with {eff} workers", err=True)
     result = syncer.execute(plan, prune=prune, workers=workers, on_done=done, on_error=error)
+    for path in result.removed_empty:
+        typer.secho(f"  removed empty output {path}", fg=typer.colors.YELLOW, err=True)
     typer.echo(
         f"-- generated {len(result.generated)}, moved {len(result.moved)}, failed {len(result.failed)}, "
-        f"pruned {len(result.pruned)}, manual {len(result.manual)}",
+        f"pruned {len(result.pruned)}, removed-empty {len(result.removed_empty)}, manual {len(result.manual)}",
         err=True,
     )
     return 1 if result.failed else 0
@@ -276,13 +278,14 @@ def list_cmd(
     engine: str = Engine,
     exclude_name: Optional[list[str]] = ExcludeName,
     exclude_path: Optional[list[str]] = ExcludePath,
+    min_chars: int = MinChars,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Also list up-to-date and unsupported files."),
     use_gdrive: Optional[bool] = GDrive,
     adopt: bool = Adopt,
 ) -> None:
     """List the documents that would be (re)generated, without converting anything."""
     conv = _converter(engine, False, False, None, DEFAULT_MODEL, None)
-    plan = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path, adopt=adopt).plan()
+    plan = _syncer(source, dest, conv, _resolver(use_gdrive), exclude_name, exclude_path, min_chars, adopt=adopt).plan()
     _print_plan(plan, verbose=verbose)
     raise typer.Exit(1 if plan.errors else 0)
 
