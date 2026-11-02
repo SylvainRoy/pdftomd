@@ -6,6 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from pdftomd import cli
+from pdftomd.converters.fallback import FallbackConverter
 from tests.test_sync import FakeConverter, OutputConverter
 
 runner = CliRunner()
@@ -165,3 +166,88 @@ def test_sync_reports_tiny_engine_output_as_failed(tree, monkeypatch):
     assert result.exit_code == 1
     assert "FAILED a.pdf" in result.output
     assert "non-whitespace" in result.output
+
+
+def test_gemini_options_reach_converter(tree, monkeypatch):
+    src, dst = tree
+    captured = {}
+
+    def capture_converter(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeConverter()
+
+    monkeypatch.setattr(cli, "_converter", capture_converter)
+    result = runner.invoke(
+        cli.app,
+        [
+            "sync",
+            str(src),
+            str(dst),
+            "--dry-run",
+            "--gemini-fallback-model",
+            "gemini-4-argon",
+            "--gemini-temperature",
+            "0.8",
+            "--gemini-chunk-pages",
+            "3",
+            "--fallback-engine",
+            "marker",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["fallback_model"] == "gemini-4-argon"
+    assert captured["temperature"] == 0.8
+    assert captured["chunk_pages"] == 3
+    assert captured["fallback_engine"] == "marker"
+
+
+def test_fallback_engine_marker_builds_wrapper(monkeypatch):
+    created = []
+
+    def fake_get_converter(name, **kwargs):
+        converter = FakeConverter()
+        converter.name = name
+        converter.options = kwargs
+        created.append(converter)
+        return converter
+
+    monkeypatch.setattr(cli, "get_converter", fake_get_converter)
+    converter = cli._converter(
+        "gemini",
+        True,
+        True,
+        ["eng"],
+        cli.DEFAULT_MODEL,
+        None,
+        fallback_engine="marker",
+    )
+
+    assert isinstance(converter, FallbackConverter)
+    assert converter.name == "gemini"
+    assert created[0].options["fail_fast_on_recitation"] is True
+    assert created[1].options == {"force_ocr": True, "use_llm": True, "languages": ["eng"]}
+
+
+def test_fallback_engine_foo_is_rejected(tree):
+    src, dst = tree
+    result = runner.invoke(
+        cli.app,
+        ["sync", str(src), str(dst), "--engine", "gemini", "--fallback-engine", "foo", "--dry-run"],
+    )
+
+    assert result.exit_code == 2
+    assert "only 'marker' is supported" in result.output
+
+
+def test_fallback_engine_is_rejected_for_marker_engine():
+    with pytest.raises(cli.typer.BadParameter, match="only valid with --engine gemini"):
+        cli._converter(
+            "marker",
+            False,
+            False,
+            None,
+            cli.DEFAULT_MODEL,
+            None,
+            fallback_engine="marker",
+        )
