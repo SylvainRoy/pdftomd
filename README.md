@@ -104,8 +104,14 @@ the source file or `--overwrite-edited` to replace it.
 
 Engine output with fewer than `--min-chars` non-whitespace characters
 (default: 10) is reported as `FAILED` and no `.md` is written; the file is
-retried on the next sync. Drive-native `.gdoc` and `.gsheet` Markdown exports
-are not checked. Use `--min-chars 0` to disable this check.
+retried on the next sync. Existing engine-generated outputs below the
+threshold are automatically reconverted with reason `output-empty`, even if
+the Markdown was edited by hand. Drive-native `.gdoc`/`.gsheet` exports and
+manual Markdown files are exempt. If reconversion fails, the tiny output is
+deleted and its manifest entry dropped so the next run retries it as new.
+`--dry-run` and `list` show these files; `list --min-chars 0` disables the
+check. For Gemini RECITATION failures, combine `--engine gemini` with
+`--fallback-engine marker` to regenerate locally.
 
 ## Excluding files and directories
 
