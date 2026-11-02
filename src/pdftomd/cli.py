@@ -11,7 +11,7 @@ import typer
 from . import __version__
 from .converters import ENGINES, ConversionError, get_converter
 from .converters.base import MIN_CONTENT_CHARS, ensure_content
-from .converters.gemini import DEFAULT_MODEL
+from .converters.gemini import DEFAULT_CHUNK_PAGES, DEFAULT_MODEL, DEFAULT_TEMPERATURE
 from .sync import ManualAction, PlannedItem, Reason, Syncer, SyncPlan
 
 app = typer.Typer(
@@ -30,6 +30,9 @@ Langs = typer.Option(None, "--lang", help="(marker) OCR language(s), e.g. --lang
 GeminiModel = typer.Option(DEFAULT_MODEL, "--gemini-model", help="(gemini) Model name.")
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
 GeminiTimeout = typer.Option(300.0, "--gemini-timeout", help="(gemini) Per-request timeout in seconds; stalled requests are retried.")
+GeminiTemperature = typer.Option(DEFAULT_TEMPERATURE, "--gemini-temperature", min=0.0, max=2.0, help="(gemini) Sampling temperature; Google recommends 1.0 for Gemini 3+.")
+GeminiFallback = typer.Option(None, "--gemini-fallback-model", help="(gemini) Model retried when the main model returns no text (e.g. gemini-4-argon, paid tier only).")
+GeminiChunkPages = typer.Option(DEFAULT_CHUNK_PAGES, "--gemini-chunk-pages", min=0, help="(gemini) Last resort for blocked/empty answers: convert the PDF N pages at a time (0 disables).")
 Workers = typer.Option(5, "--workers", "-j", min=1, help="Number of documents converted in parallel (gemini engine only; marker always uses 1).")
 MinChars = typer.Option(MIN_CONTENT_CHARS, "--min-chars", min=0, help="Fail a conversion whose Markdown has fewer non-whitespace characters than this (engine output only; 0 disables).")
 ExcludeName = typer.Option(None, "--exclude-name", "-x", help="Skip files/directories whose name fully matches this regex (any depth). Repeatable.")
@@ -48,22 +51,49 @@ Adopt = typer.Option(
 OverwriteEdited = typer.Option(False, "--overwrite-edited", help="Regenerate outputs even if their .md was edited by hand.")
 
 
-def _converter(engine: str, force_ocr: bool, use_llm: bool, langs: Optional[list[str]], model: str, api_key: Optional[str], timeout: float = 300.0):
+def _converter(
+    engine: str,
+    force_ocr: bool,
+    use_llm: bool,
+    langs: Optional[list[str]],
+    model: str,
+    api_key: Optional[str],
+    timeout: float = 300.0,
+    *,
+    temperature: float = DEFAULT_TEMPERATURE,
+    fallback_model: Optional[str] = None,
+    chunk_pages: int = DEFAULT_CHUNK_PAGES,
+):
     engine = engine.lower()
     if engine not in ENGINES:
         raise typer.BadParameter(f"engine must be one of {ENGINES}")
     if engine == "marker":
         return get_converter("marker", force_ocr=force_ocr, use_llm=use_llm, languages=langs or None)
-    return get_converter("gemini", model=model, api_key=api_key, request_timeout=timeout)
+    return get_converter(
+        "gemini",
+        model=model,
+        api_key=api_key,
+        request_timeout=timeout,
+        temperature=temperature,
+        fallback_model=fallback_model,
+        chunk_pages=chunk_pages,
+    )
 
 
-def _describer(conv, model: str, api_key: Optional[str], timeout: float):
+def _describer(
+    conv,
+    model: str,
+    api_key: Optional[str],
+    timeout: float,
+    *,
+    temperature: float = DEFAULT_TEMPERATURE,
+):
     """Gemini vision for images embedded in Google Docs exports; None when no key is configured."""
     if hasattr(conv, "describe_image"):
         return conv
     if not (api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
         return None
-    return get_converter("gemini", model=model, api_key=api_key, request_timeout=timeout)
+    return get_converter("gemini", model=model, api_key=api_key, request_timeout=timeout, temperature=temperature)
 
 
 def _resolver(enabled: Optional[bool], describer=None):
@@ -184,11 +214,31 @@ def sync(
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
     gemini_timeout: float = GeminiTimeout,
+    gemini_temperature: float = GeminiTemperature,
+    gemini_fallback_model: Optional[str] = GeminiFallback,
+    gemini_chunk_pages: int = GeminiChunkPages,
 ) -> None:
     """Synchronise SOURCE into DEST, regenerating only stale Markdown files."""
-    conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
+    conv = _converter(
+        engine,
+        force_ocr,
+        use_llm,
+        lang,
+        gemini_model,
+        gemini_api_key,
+        gemini_timeout,
+        temperature=gemini_temperature,
+        fallback_model=gemini_fallback_model,
+        chunk_pages=gemini_chunk_pages,
+    )
     syncer = _syncer(
-        source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)),
+        source,
+        dest,
+        conv,
+        _resolver(
+            use_gdrive,
+            _describer(conv, gemini_model, gemini_api_key, gemini_timeout, temperature=gemini_temperature),
+        ),
         exclude_name, exclude_path, min_chars, adopt,
     )
     try:
@@ -232,15 +282,37 @@ def convert(
     gemini_api_key: Optional[str] = GeminiKey,
     gemini_timeout: float = GeminiTimeout,
     min_chars: int = MinChars,
+    gemini_temperature: float = GeminiTemperature,
+    gemini_fallback_model: Optional[str] = GeminiFallback,
+    gemini_chunk_pages: int = GeminiChunkPages,
 ) -> None:
     """Convert a single document (or Google Drive stub) and print the Markdown to stdout."""
     from .gdrive import GoogleDriveResolver, is_stub
 
-    conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
+    conv = _converter(
+        engine,
+        force_ocr,
+        use_llm,
+        lang,
+        gemini_model,
+        gemini_api_key,
+        gemini_timeout,
+        temperature=gemini_temperature,
+        fallback_model=gemini_fallback_model,
+        chunk_pages=gemini_chunk_pages,
+    )
     started = time.monotonic()
     try:
         if is_stub(file):
-            doc = GoogleDriveResolver(describer=_describer(conv, gemini_model, gemini_api_key, gemini_timeout)).resolve(file)
+            doc = GoogleDriveResolver(
+                describer=_describer(
+                    conv,
+                    gemini_model,
+                    gemini_api_key,
+                    gemini_timeout,
+                    temperature=gemini_temperature,
+                )
+            ).resolve(file)
             if doc.markdown is not None:
                 markdown = doc.markdown
             else:
@@ -280,13 +352,33 @@ def watch(
     gemini_model: str = GeminiModel,
     gemini_api_key: Optional[str] = GeminiKey,
     gemini_timeout: float = GeminiTimeout,
+    gemini_temperature: float = GeminiTemperature,
+    gemini_fallback_model: Optional[str] = GeminiFallback,
+    gemini_chunk_pages: int = GeminiChunkPages,
     adopt: bool = Adopt,
     overwrite_edited: bool = OverwriteEdited,
 ) -> None:
     """Keep DEST in sync with SOURCE, re-scanning periodically until interrupted."""
-    conv = _converter(engine, force_ocr, use_llm, lang, gemini_model, gemini_api_key, gemini_timeout)
+    conv = _converter(
+        engine,
+        force_ocr,
+        use_llm,
+        lang,
+        gemini_model,
+        gemini_api_key,
+        gemini_timeout,
+        temperature=gemini_temperature,
+        fallback_model=gemini_fallback_model,
+        chunk_pages=gemini_chunk_pages,
+    )
     syncer = _syncer(
-        source, dest, conv, _resolver(use_gdrive, _describer(conv, gemini_model, gemini_api_key, gemini_timeout)),
+        source,
+        dest,
+        conv,
+        _resolver(
+            use_gdrive,
+            _describer(conv, gemini_model, gemini_api_key, gemini_timeout, temperature=gemini_temperature),
+        ),
         exclude_name, exclude_path, min_chars, adopt,
     )
     typer.echo(f"watching {syncer.source_dir} every {interval:g}s (Ctrl-C to stop)", err=True)

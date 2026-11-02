@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import re
 import time
+from pathlib import Path
+from typing import Iterator
 
 from .base import ConversionError, Converter, guess_mime
 
-DEFAULT_MODEL = "gemini-3.6-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_TEMPERATURE = 1.0
+DEFAULT_CHUNK_PAGES = 5
 INLINE_LIMIT_BYTES = 19 * 1024 * 1024  # Gemini inline request limit is ~20MB
+
+
+class GeminiNoTextError(ConversionError):
+    """Gemini answered but did not provide usable text."""
+
 
 SYSTEM_PROMPT = """\
 You are an expert document transcription engine. Convert the attached document
@@ -46,14 +56,51 @@ CONTINUE_PROMPT = (
     "any preamble."
 )
 
+ALT_USER_PROMPT = (
+    "This is the user's own document, being archived as searchable Markdown. "
+    "Transcribe its full text faithfully, page by page, following the system rules."
+)
+
+
+def _diagnose(response) -> str:
+    fields = []
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        candidate = candidates[0]
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason is not None:
+            fields.append(f"finish_reason={getattr(finish_reason, 'name', finish_reason)}")
+        finish_message = getattr(candidate, "finish_message", None)
+        if finish_message is not None:
+            fields.append(f"finish_message={finish_message}")
+    feedback = getattr(response, "prompt_feedback", None)
+    if feedback is not None:
+        block_reason = getattr(feedback, "block_reason", None)
+        if block_reason is not None:
+            fields.append(f"block_reason={getattr(block_reason, 'name', block_reason)}")
+        block_reason_message = getattr(feedback, "block_reason_message", None)
+        if block_reason_message is not None:
+            fields.append(f"block_reason_message={block_reason_message}")
+    usage = getattr(response, "usage_metadata", None)
+    if usage is not None:
+        output_tokens = getattr(usage, "candidates_token_count", None)
+        if output_tokens is not None:
+            fields.append(f"output_tokens={output_tokens}")
+        thinking_tokens = getattr(usage, "thoughts_token_count", None)
+        if thinking_tokens is not None:
+            fields.append(f"thinking_tokens={thinking_tokens}")
+    return ", ".join(fields)
+
 
 class GeminiConverter(Converter):
-    """Conversion through the Google Gemini API (default: Gemini 3.6 Flash).
+    """Conversion through the Google Gemini API (default: Gemini 3.8 Flash).
 
     The whole document is sent in a single request so that Gemini sees
     multi-page tables in context. Documents above the inline size limit are
     uploaded through the Files API and deleted afterwards. If the answer hits
     the output-token limit, the conversation is continued until complete.
+    Blocked/empty answers retry with an alternate user prompt, optional fallback
+    model, and page chunks for long PDFs.
     """
 
     name = "gemini"
@@ -64,12 +111,18 @@ class GeminiConverter(Converter):
         *,
         api_key: str | None = None,
         model: str = DEFAULT_MODEL,
+        temperature: float = DEFAULT_TEMPERATURE,
+        fallback_model: str | None = None,
+        chunk_pages: int = DEFAULT_CHUNK_PAGES,
         max_continuations: int = 30,
         retries: int = 3,
         request_timeout: float = 300.0,
     ) -> None:
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         self.model = model
+        self.temperature = temperature
+        self.fallback_model = fallback_model
+        self.chunk_pages = chunk_pages
         self.max_continuations = max_continuations
         self.retries = retries
         self.request_timeout = request_timeout
@@ -102,38 +155,158 @@ class GeminiConverter(Converter):
         client = self._get_client()
         mime = guess_mime(filename)
         uploaded = None
+        failures: list[tuple[str, str]] = []
         try:
             if len(data) <= INLINE_LIMIT_BYTES:
                 doc_part = types.Part.from_bytes(data=data, mime_type=mime)
             else:
                 uploaded = self._upload(client, data, mime)
                 doc_part = types.Part.from_uri(file_uri=uploaded.uri, mime_type=mime)
-            return self._transcribe(client, types, doc_part)
+
+            models = [self.model]
+            if self.fallback_model and self.fallback_model != self.model:
+                models.append(self.fallback_model)
+
+            full_attempts = []
+            for model in models:
+                full_attempts.append((model, "Convert this document to Markdown.", f"{model}/full"))
+                full_attempts.append((model, ALT_USER_PROMPT, f"{model}/full-alt"))
+
+            for model, prompt, label in full_attempts:
+                try:
+                    text = self._transcribe(client, types, doc_part, model=model, user_prompt=prompt)
+                except GeminiNoTextError as exc:
+                    failures.append((label, str(exc)))
+                else:
+                    return self._finish_attempt(text, filename, label, failures)
+
+            if Path(filename).suffix.lower() == ".pdf" and self.chunk_pages > 0:
+                if self._pdf_page_count(data) > self.chunk_pages:
+                    for model in models:
+                        label = f"{model}/chunks"
+                        try:
+                            text = self._transcribe_chunks(client, types, data, model=model)
+                        except GeminiNoTextError as exc:
+                            failures.append((label, str(exc)))
+                        else:
+                            return self._finish_attempt(text, filename, label, failures)
+
+            details = "; ".join(f"{label}: {diagnostic}" for label, diagnostic in failures)
+            raise GeminiNoTextError(
+                f"{filename}: Gemini returned no usable text after {len(failures)} attempt(s): {details}"
+            )
         finally:
             if uploaded is not None:
-                try:
-                    client.files.delete(name=uploaded.name)
-                except Exception:
-                    pass
+                self._delete_upload(client, uploaded)
 
-    def _transcribe(self, client, types, doc_part) -> str:
-        config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=0.0)
-        history = [types.Content(role="user", parts=[doc_part, types.Part.from_text(text="Convert this document to Markdown.")])]
+    def _finish_attempt(self, text: str, filename: str, label: str, failures: list[tuple[str, str]]) -> str:
+        if failures:
+            earlier = "; ".join(f"{attempt}: {diagnostic}" for attempt, diagnostic in failures)
+            logging.getLogger(__name__).warning(f"{filename}: converted via {label} after: {earlier}")
+        return _strip_outer_fence(text).strip() + "\n"
+
+    def _transcribe(self, client, types, doc_part, *, model: str, user_prompt: str) -> str:
+        config = types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, temperature=self.temperature)
+        history = [types.Content(role="user", parts=[doc_part, types.Part.from_text(text=user_prompt)])]
         chunks: list[str] = []
+        last = None
         for _ in range(self.max_continuations + 1):
-            response = self._generate(client, history, config)
-            text = response.text or ""
+            response = self._generate(client, history, config, model)
+            last = response
+            candidates = getattr(response, "candidates", None) or []
+            if not candidates:
+                raise GeminiNoTextError(f"prompt blocked ({_diagnose(response)})")
+            candidate = candidates[0]
+            finish_reason = getattr(candidate, "finish_reason", None)
+            finish = getattr(finish_reason, "name", finish_reason)
+            text = getattr(response, "text", None) or ""
             chunks.append(text)
-            finish = None
-            if response.candidates:
-                finish = getattr(response.candidates[0].finish_reason, "name", str(response.candidates[0].finish_reason))
-            if finish != "MAX_TOKENS":
+            if finish == "MAX_TOKENS":
+                history.append(types.Content(role="model", parts=[types.Part.from_text(text=text)]))
+                history.append(types.Content(role="user", parts=[types.Part.from_text(text=CONTINUE_PROMPT)]))
+                continue
+            if finish not in (None, "", "STOP", "FINISH_REASON_UNSPECIFIED"):
+                raise GeminiNoTextError(_diagnose(response))
+            else:
                 break
-            history.append(types.Content(role="model", parts=[types.Part.from_text(text=text)]))
-            history.append(types.Content(role="user", parts=[types.Part.from_text(text=CONTINUE_PROMPT)]))
         else:
             raise ConversionError("Gemini output was still truncated after the maximum number of continuations.")
-        return _strip_outer_fence("".join(chunks)).strip() + "\n"
+        text = "".join(chunks)
+        if not text.strip():
+            raise GeminiNoTextError(f"empty response ({_diagnose(last)})")
+        return text
+
+    def _transcribe_chunks(self, client, types, data: bytes, *, model: str) -> str:
+        output = []
+        for start, end, chunk_data in self._iter_pdf_chunks(data):
+            uploaded = None
+            try:
+                if len(chunk_data) <= INLINE_LIMIT_BYTES:
+                    doc_part = types.Part.from_bytes(data=chunk_data, mime_type="application/pdf")
+                else:
+                    uploaded = self._upload(client, chunk_data, "application/pdf")
+                    doc_part = types.Part.from_uri(file_uri=uploaded.uri, mime_type="application/pdf")
+                try:
+                    text = self._transcribe(
+                        client,
+                        types,
+                        doc_part,
+                        model=model,
+                        user_prompt="Convert this document to Markdown.",
+                    )
+                except GeminiNoTextError as normal_error:
+                    try:
+                        text = self._transcribe(
+                            client,
+                            types,
+                            doc_part,
+                            model=model,
+                            user_prompt=ALT_USER_PROMPT,
+                        )
+                    except GeminiNoTextError as alternate_error:
+                        raise GeminiNoTextError(
+                            f"pages {start}-{end}: normal prompt: {normal_error}; "
+                            f"alternate prompt: {alternate_error}"
+                        ) from alternate_error
+                output.append(text.strip())
+            finally:
+                if uploaded is not None:
+                    self._delete_upload(client, uploaded)
+        return "\n\n".join(output)
+
+    def _pdf_page_count(self, data: bytes) -> int:
+        import pypdfium2 as pdfium
+
+        document = pdfium.PdfDocument(data)
+        try:
+            return len(document)
+        finally:
+            document.close()
+
+    def _iter_pdf_chunks(self, data: bytes) -> Iterator[tuple[int, int, bytes]]:
+        import pypdfium2 as pdfium
+
+        source = pdfium.PdfDocument(data)
+        try:
+            for start in range(0, len(source), self.chunk_pages):
+                end = min(start + self.chunk_pages, len(source))
+                chunk = pdfium.PdfDocument.new()
+                try:
+                    chunk.import_pages(source, list(range(start, end)))
+                    buffer = io.BytesIO()
+                    chunk.save(buffer)
+                    yield start + 1, end, buffer.getvalue()
+                finally:
+                    chunk.close()
+        finally:
+            source.close()
+
+    @staticmethod
+    def _delete_upload(client, uploaded) -> None:
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            pass
 
     def describe_image(self, data: bytes, mime: str) -> str:
         """Transcribe/describe a single picture (used for images embedded in Google Docs exports)."""
@@ -141,8 +314,13 @@ class GeminiConverter(Converter):
 
         client = self._get_client()
         contents = [types.Content(role="user", parts=[types.Part.from_bytes(data=data, mime_type=mime), types.Part.from_text(text=IMAGE_PROMPT)])]
-        response = self._generate(client, contents, types.GenerateContentConfig(temperature=0.0))
-        return _strip_outer_fence(response.text or "").strip()
+        response = self._generate(
+            client,
+            contents,
+            types.GenerateContentConfig(temperature=self.temperature),
+            self.model,
+        )
+        return _strip_outer_fence(getattr(response, "text", None) or "").strip()
 
     def _upload(self, client, data: bytes, mime: str):
         last: Exception | None = None
@@ -170,11 +348,11 @@ class GeminiConverter(Converter):
             raise ConversionError(f"Gemini file upload ended in state {uploaded.state!r}.")
         return uploaded
 
-    def _generate(self, client, contents, config):
+    def _generate(self, client, contents, config, model: str):
         last: Exception | None = None
         for attempt in range(self.retries):
             try:
-                return client.models.generate_content(model=self.model, contents=contents, config=config)
+                return client.models.generate_content(model=model, contents=contents, config=config)
             except Exception as exc:  # transient API errors (429/5xx)
                 last = exc
                 time.sleep(2 ** attempt)

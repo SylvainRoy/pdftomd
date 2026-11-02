@@ -165,3 +165,34 @@ def test_sync_reports_tiny_engine_output_as_failed(tree, monkeypatch):
     assert result.exit_code == 1
     assert "FAILED a.pdf" in result.output
     assert "non-whitespace" in result.output
+
+
+def test_gemini_options_reach_converter(tree, monkeypatch):
+    src, dst = tree
+    captured = {}
+
+    def capture_converter(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeConverter()
+
+    monkeypatch.setattr(cli, "_converter", capture_converter)
+    result = runner.invoke(
+        cli.app,
+        [
+            "sync",
+            str(src),
+            str(dst),
+            "--dry-run",
+            "--gemini-fallback-model",
+            "gemini-4-argon",
+            "--gemini-temperature",
+            "0.8",
+            "--gemini-chunk-pages",
+            "3",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["fallback_model"] == "gemini-4-argon"
+    assert captured["temperature"] == 0.8
+    assert captured["chunk_pages"] == 3

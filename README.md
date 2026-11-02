@@ -9,7 +9,7 @@ Two conversion engines are available, selectable with `--engine`:
 | engine   | how it works                                                                | good for                                               |
 |----------|-----------------------------------------------------------------------------|--------------------------------------------------------|
 | `marker` | local, [marker-pdf](https://github.com/datalab-to/marker) (layout + OCR)    | offline, private documents; `--force-ocr` for bad scans |
-| `gemini` | Google Gemini API (default model `gemini-3.6-flash`, configurable)          | poor scans, multi-page tables seen in full context      |
+| `gemini` | Google Gemini API (default model `gemini-3.8-flash`, configurable)          | poor scans, multi-page tables seen in full context      |
 
 Google Docs / Sheets / Slides synced by Google Drive for Desktop (`.gdoc`,
 `.gsheet`, `.gslides` stubs whose content lives online) are fetched through the
@@ -67,6 +67,8 @@ pdftomd sync  ./docs ./docs-md --dry-run
 pdftomd sync ./docs ./docs-md --engine marker --force-ocr
 pdftomd sync ./docs ./docs-md --engine gemini --gemini-model <other-model>   # override the default
 pdftomd sync ./docs ./docs-md --engine gemini --workers 8   # parallel API calls (default 5)
+pdftomd sync ./docs ./docs-md --engine gemini --gemini-temperature 1.0
+pdftomd sync ./docs ./docs-md --engine gemini --gemini-fallback-model gemini-4-argon --gemini-chunk-pages 5
 
 # Force specific files (relative to the source dir), even if up to date.
 pdftomd sync ./docs ./docs-md --select reports/2024/q3.pdf --select scans/invoice.png
@@ -214,12 +216,23 @@ implement `convert_bytes(data, *, filename) -> str`.
   tables across pages and fixes forms (uses Gemini under the hood).
 * **gemini**: the whole document is sent in one request with a strict
   transcription prompt (merge multi-page tables, mark `[illegible]` rather than
-  guess, temperature 0). Files over ~20 MB go through the Files API; output
+  guess, temperature 1.0). Files over ~20 MB go through the Files API; output
   truncated at the token limit is continued automatically. Documents are
   converted `--workers` at a time (default 5); marker always runs one at a time
   because its models are shared. Every API call has a
   300 s timeout (`--gemini-timeout`) and is retried, so a stalled connection
   cannot hang the sync.
+
+### Blocked or empty Gemini answers
+
+When Gemini returns no usable text, the `FAILED` message includes its
+diagnostic, such as `finish_reason=RECITATION` or `finish_reason=SAFETY`.
+Gemini 3+ uses the recommended sampling temperature of `1.0` by default.
+pdftomd retries with an alternate user prompt, then (if configured) a fallback
+model, and finally converts eligible PDFs in page chunks; chunking can split
+tables that span chunk boundaries. `--gemini-fallback-model gemini-4-argon`
+can help with files blocked by the primary model, but it is paid-tier only,
+pricier, and only used for files whose earlier attempts return no text.
 
 ## Troubleshooting
 
