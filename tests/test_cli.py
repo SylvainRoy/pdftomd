@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from pdftomd import cli
-from tests.test_sync import FakeConverter
+from tests.test_sync import FakeConverter, OutputConverter
 
 runner = CliRunner()
 
@@ -135,3 +135,33 @@ def test_convert_single_file_to_stdout(tree, fake_engine):
     res = runner.invoke(cli.app, ["convert", str(src / "a.pdf")])
     assert res.exit_code == 0
     assert "# a.pdf" in res.output  # stderr (timing line) is mixed into output by CliRunner
+
+
+def test_convert_rejects_tiny_engine_output_and_min_chars_can_disable(tree, monkeypatch, tmp_path):
+    src, _ = tree
+    conv = OutputConverter({"a.pdf": "x"})
+    monkeypatch.setattr(cli, "_converter", lambda *a, **k: conv)
+    output = tmp_path / "tiny.md"
+
+    result = runner.invoke(cli.app, ["convert", str(src / "a.pdf"), "--output", str(output)])
+    assert result.exit_code == 1
+    assert "non-whitespace" in result.output
+    assert not output.exists()
+
+    result = runner.invoke(
+        cli.app,
+        ["convert", str(src / "a.pdf"), "--output", str(output), "--min-chars", "0"],
+    )
+    assert result.exit_code == 0, result.output
+    assert output.read_text() == "x"
+
+
+def test_sync_reports_tiny_engine_output_as_failed(tree, monkeypatch):
+    src, dst = tree
+    conv = OutputConverter({"a.pdf": "x"})
+    monkeypatch.setattr(cli, "_converter", lambda *a, **k: conv)
+
+    result = runner.invoke(cli.app, ["sync", str(src), str(dst)])
+    assert result.exit_code == 1
+    assert "FAILED a.pdf" in result.output
+    assert "non-whitespace" in result.output

@@ -186,6 +186,20 @@ def test_sync_mixes_local_and_remote(tree, drive):
     assert manifest["notes.gdoc"]["fingerprint"].startswith("v1@")
 
 
+def test_empty_drive_native_markdown_is_not_rejected(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    write_stub(src / "empty.gdoc", "EMPTYDOC")
+    drive = FakeDrive()
+    drive.add("EMPTYDOC", MIME_DOC, "Empty document", {MIME_MD: b""})
+
+    result = Syncer(src, tmp_path / "dst", FakeConverter(), gdrive=GoogleDriveResolver(drive)).sync()
+
+    assert result.failed == {}
+    assert result.generated == ["empty.gdoc"]
+    assert (tmp_path / "dst" / "empty.md").read_text().strip() == ""
+
+
 def test_remote_edit_detected_without_stub_change(tree, drive):
     src, dst = tree
     Syncer(src, dst, FakeConverter(), gdrive=GoogleDriveResolver(drive)).sync()

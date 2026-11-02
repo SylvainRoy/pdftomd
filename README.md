@@ -99,6 +99,11 @@ orphans instead. Generated Markdown edited by hand is reported as `[edited]`
 and is not overwritten on regeneration, even with `--force`; use `--select` on
 the source file or `--overwrite-edited` to replace it.
 
+Engine output with fewer than `--min-chars` non-whitespace characters
+(default: 10) is reported as `FAILED` and no `.md` is written; the file is
+retried on the next sync. Drive-native `.gdoc` and `.gsheet` Markdown exports
+are not checked. Use `--min-chars 0` to disable this check.
+
 ## Excluding files and directories
 
 `sync`, `list` and `watch` accept two repeatable exclusion flags that apply to

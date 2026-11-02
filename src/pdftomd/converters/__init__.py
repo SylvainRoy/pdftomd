@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .base import ConversionError, Converter
+from .base import ConversionError, Converter, EmptyOutputError
 
 ENGINES = ("marker", "gemini")
 
@@ -20,4 +20,4 @@ def get_converter(engine: str, **options: Any) -> Converter:
     raise ValueError(f"Unknown engine {engine!r}; expected one of {ENGINES}")
 
 
-__all__ = ["ConversionError", "Converter", "ENGINES", "get_converter"]
+__all__ = ["ConversionError", "Converter", "EmptyOutputError", "ENGINES", "get_converter"]
