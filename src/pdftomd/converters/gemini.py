@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import random
 import re
 import time
 from pathlib import Path
@@ -13,7 +14,24 @@ from .base import ConversionError, Converter, guess_mime
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_TEMPERATURE = 1.0
 DEFAULT_CHUNK_PAGES = 5
+DEFAULT_RETRIES = 6
+BACKOFF_BASE = 2.0
+BACKOFF_MAX = 60.0
 INLINE_LIMIT_BYTES = 19 * 1024 * 1024  # Gemini inline request limit is ~20MB
+
+
+def _backoff_delay(attempt: int) -> float:
+    return min(BACKOFF_MAX, BACKOFF_BASE * 2**attempt) + random.uniform(0, 1)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    try:
+        from google.genai import errors
+    except ImportError:
+        return True
+    if isinstance(exc, errors.APIError):
+        return exc.code == 429 or exc.code >= 500
+    return True
 
 
 class GeminiNoTextError(ConversionError):
@@ -115,7 +133,7 @@ class GeminiConverter(Converter):
         fallback_model: str | None = None,
         chunk_pages: int = DEFAULT_CHUNK_PAGES,
         max_continuations: int = 30,
-        retries: int = 3,
+        retries: int = DEFAULT_RETRIES,
         request_timeout: float = 300.0,
     ) -> None:
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
@@ -333,8 +351,11 @@ class GeminiConverter(Converter):
                 uploaded = client.files.upload(file=io.BytesIO(data), config={"mime_type": mime})
                 break
             except Exception as exc:  # transient upload errors / stalls
+                if not _is_retryable(exc):
+                    raise ConversionError(f"Gemini file upload failed: {exc}") from exc
                 last = exc
-                time.sleep(2 ** attempt)
+                if attempt + 1 < self.retries:
+                    time.sleep(_backoff_delay(attempt))
         if uploaded is None:
             raise ConversionError(f"Gemini file upload failed after {self.retries} attempts: {last}") from last
         deadline = time.monotonic() + self.request_timeout
@@ -357,8 +378,11 @@ class GeminiConverter(Converter):
             try:
                 return client.models.generate_content(model=model, contents=contents, config=config)
             except Exception as exc:  # transient API errors (429/5xx)
+                if not _is_retryable(exc):
+                    raise ConversionError(f"Gemini request failed: {exc}") from exc
                 last = exc
-                time.sleep(2 ** attempt)
+                if attempt + 1 < self.retries:
+                    time.sleep(_backoff_delay(attempt))
         raise ConversionError(f"Gemini request failed after {self.retries} attempts: {last}") from last
 
 

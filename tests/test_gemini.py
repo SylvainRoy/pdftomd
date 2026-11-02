@@ -5,9 +5,10 @@ from types import SimpleNamespace
 
 import pypdfium2 as pdfium
 import pytest
-from google.genai import types
+from google.genai import errors, types
 
 from pdftomd.converters.base import ConversionError
+from pdftomd.converters import gemini as gemini_module
 from pdftomd.converters.gemini import (
     ALT_USER_PROMPT,
     DEFAULT_MODEL,
@@ -57,8 +58,11 @@ class FakeClient:
         self.models = FakeModels(script)
 
 
-def _converter(monkeypatch, script, **kwargs):
-    monkeypatch.setattr("pdftomd.converters.gemini.time.sleep", lambda *_: None)
+def _converter(monkeypatch, script, *, sleep_delays=None, **kwargs):
+    monkeypatch.setattr(
+        "pdftomd.converters.gemini.time.sleep",
+        lambda delay: sleep_delays.append(delay) if sleep_delays is not None else None,
+    )
     options = {"retries": 1, **kwargs}
     conv = GeminiConverter(**options)
     conv._client = FakeClient(script)
@@ -258,3 +262,103 @@ def test_describe_image_uses_configured_temperature(monkeypatch):
 
     assert conv.describe_image(b"image", "image/png") == "description"
     assert conv._client.models.calls[0][2].temperature == 1.0
+
+
+def test_generate_retries_503_with_backoff(monkeypatch):
+    unavailable = errors.ServerError(
+        503,
+        {"error": {"code": 503, "message": "high demand", "status": "UNAVAILABLE"}},
+    )
+    delays = []
+    conv = _converter(
+        monkeypatch,
+        [unavailable, unavailable, _response("recovered")],
+        retries=6,
+        sleep_delays=delays,
+    )
+
+    assert conv.convert_bytes(b"image", filename="scan.png") == "recovered\n"
+    assert len(conv._client.models.calls) == 3
+    assert len(delays) == 2
+
+
+def test_generate_retries_429(monkeypatch):
+    rate_limited = errors.ClientError(
+        429,
+        {"error": {"code": 429, "message": "rate limited", "status": "RESOURCE_EXHAUSTED"}},
+    )
+    delays = []
+    conv = _converter(monkeypatch, [rate_limited, _response("recovered")], retries=6, sleep_delays=delays)
+
+    assert conv.convert_bytes(b"image", filename="scan.png") == "recovered\n"
+    assert len(conv._client.models.calls) == 2
+    assert len(delays) == 1
+
+
+def test_generate_fails_fast_on_client_error(monkeypatch):
+    invalid_request = errors.ClientError(
+        400,
+        {"error": {"code": 400, "message": "bad request", "status": "INVALID_ARGUMENT"}},
+    )
+    delays = []
+    conv = _converter(monkeypatch, [invalid_request], retries=6, sleep_delays=delays)
+
+    with pytest.raises(ConversionError, match="Gemini request failed:"):
+        conv.convert_bytes(b"image", filename="scan.png")
+
+    assert len(conv._client.models.calls) == 1
+    assert delays == []
+
+
+def test_generate_exhausts_retries_without_sleeping_after_last_attempt(monkeypatch):
+    unavailable = errors.ServerError(
+        503,
+        {"error": {"code": 503, "message": "high demand", "status": "UNAVAILABLE"}},
+    )
+    delays = []
+    conv = _converter(monkeypatch, [unavailable] * 6, retries=6, sleep_delays=delays)
+
+    with pytest.raises(ConversionError, match="Gemini request failed after 6 attempts"):
+        conv.convert_bytes(b"image", filename="scan.png")
+
+    assert len(conv._client.models.calls) == 6
+    assert len(delays) == 5
+
+
+def test_backoff_delay_doubles_and_caps(monkeypatch):
+    monkeypatch.setattr(gemini_module.random, "uniform", lambda *_: 0)
+
+    assert [gemini_module._backoff_delay(attempt) for attempt in range(7)] == [2, 4, 8, 16, 32, 60, 60]
+
+
+def test_upload_retries_503_with_backoff(monkeypatch):
+    unavailable = errors.ServerError(
+        503,
+        {"error": {"code": 503, "message": "high demand", "status": "UNAVAILABLE"}},
+    )
+    delays = []
+    conv = _converter(monkeypatch, [], retries=6, sleep_delays=delays)
+
+    class FakeFiles:
+        def __init__(self):
+            self.results = [unavailable, SimpleNamespace(
+                name="files/1",
+                uri="https://example.test/files/1",
+                state=SimpleNamespace(name="ACTIVE"),
+            )]
+            self.calls = 0
+
+        def upload(self, *, file, config):
+            self.calls += 1
+            result = self.results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    conv._client.files = FakeFiles()
+
+    uploaded = conv._upload(conv._client, b"document", "application/pdf")
+
+    assert uploaded.name == "files/1"
+    assert conv._client.files.calls == 2
+    assert len(delays) == 1
