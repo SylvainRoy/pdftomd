@@ -96,23 +96,23 @@ def test_stop_response_uses_default_model_and_temperature(monkeypatch):
     assert config.temperature == 1.0
 
 
-def test_recitation_retries_with_alternate_prompt(monkeypatch):
-    conv = _converter(
-        monkeypatch,
-        [_response("partial", finish_reason="RECITATION"), _response("complete text")],
-    )
+def test_recitation_skips_alternate_prompt(monkeypatch):
+    conv = _converter(monkeypatch, [_response("partial", finish_reason="RECITATION")])
 
-    assert conv.convert_bytes(b"image", filename="scan.png") == "complete text\n"
-    assert len(conv._client.models.calls) == 2
-    assert _user_text(conv._client.models.calls[1]) == ALT_USER_PROMPT
+    with pytest.raises(GeminiNoTextError) as exc_info:
+        conv.convert_bytes(b"image", filename="scan.png")
+
+    assert exc_info.value.recitation is True
+    assert "gemini-3.8-flash/full-alt" not in str(exc_info.value)
+    assert len(conv._client.models.calls) == 1
 
 
 def test_fallback_model_runs_after_both_primary_prompts_fail(monkeypatch):
     conv = _converter(
         monkeypatch,
         [
-            _response("blocked", finish_reason="RECITATION"),
-            _response("blocked", finish_reason="RECITATION"),
+            _response("blocked", finish_reason="SAFETY"),
+            _response("blocked", finish_reason="SAFETY"),
             _response("fallback success"),
         ],
         fallback_model="gemini-4-argon",
@@ -130,8 +130,8 @@ def test_long_pdf_uses_ordered_page_chunks(monkeypatch):
     conv = _converter(
         monkeypatch,
         [
-            _response("partial", finish_reason="RECITATION"),
-            _response("partial", finish_reason="RECITATION"),
+            _response("partial", finish_reason="SAFETY"),
+            _response("partial", finish_reason="SAFETY"),
             _response("first chunk"),
             _response("second chunk"),
             _response("third chunk"),
@@ -155,18 +155,59 @@ def test_long_pdf_uses_ordered_page_chunks(monkeypatch):
     assert page_counts == [5, 5, 2]
 
 
+def test_recitation_skips_full_fallback_and_alternate_chunk_prompt(monkeypatch):
+    blocked = _response("blocked", finish_reason="RECITATION")
+    conv = _converter(
+        monkeypatch,
+        [blocked, blocked],
+        fallback_model="gemini-4-argon",
+        chunk_pages=5,
+    )
+
+    with pytest.raises(GeminiNoTextError) as exc_info:
+        conv.convert_bytes(_pdf_bytes(12), filename="long.pdf")
+
+    assert exc_info.value.recitation is True
+    assert len(conv._client.models.calls) == 2
+    assert [call[0] for call in conv._client.models.calls] == [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash",
+    ]
+    assert "gemini-3.8-flash/full-alt" not in str(exc_info.value)
+    assert "gemini-4-argon/full" not in str(exc_info.value)
+    assert "gemini-4-argon/chunks" not in str(exc_info.value)
+    assert _user_text(conv._client.models.calls[1]) == "Convert this document to Markdown."
+
+
+def test_fail_fast_on_recitation_stops_before_chunks(monkeypatch):
+    conv = _converter(
+        monkeypatch,
+        [_response("blocked", finish_reason="RECITATION")],
+        chunk_pages=5,
+        fail_fast_on_recitation=True,
+    )
+
+    with pytest.raises(GeminiNoTextError) as exc_info:
+        conv.convert_bytes(_pdf_bytes(12), filename="long.pdf")
+
+    assert exc_info.value.recitation is True
+    assert "Gemini returned no usable text after 1 attempt(s)" in str(exc_info.value)
+    assert len(conv._client.models.calls) == 1
+
+
 def test_unparseable_pdf_skips_chunk_attempt(monkeypatch):
     blocked = _response("partial", finish_reason="RECITATION")
-    conv = _converter(monkeypatch, [blocked, blocked])
+    conv = _converter(monkeypatch, [blocked])
 
-    with pytest.raises(GeminiNoTextError, match="Gemini returned no usable text after 2 attempt\\(s\\)"):
+    with pytest.raises(GeminiNoTextError, match="Gemini returned no usable text after 1 attempt\\(s\\)") as exc_info:
         conv.convert_bytes(b"not a pdf", filename="bad.pdf")
 
-    assert len(conv._client.models.calls) == 2
+    assert exc_info.value.recitation is True
+    assert len(conv._client.models.calls) == 1
 
 
 def test_all_attempts_fail_with_labels_and_diagnostics(monkeypatch):
-    blocked = _response("partial", finish_reason="RECITATION")
+    blocked = _response("partial", finish_reason="SAFETY")
     conv = _converter(
         monkeypatch,
         [blocked, blocked, blocked, blocked],
@@ -186,7 +227,7 @@ def test_all_attempts_fail_with_labels_and_diagnostics(monkeypatch):
         "gemini-4-argon/full-alt",
     ):
         assert label in message
-    assert message.count("RECITATION") == 4
+    assert message.count("SAFETY") == 4
 
 
 def test_no_candidates_reports_blocked_prompt(monkeypatch):
@@ -232,7 +273,7 @@ def test_max_tokens_continuation_concatenates_text(monkeypatch):
 def test_non_pdf_does_not_use_chunk_attempt(monkeypatch):
     conv = _converter(
         monkeypatch,
-        [_response("partial", finish_reason="RECITATION"), _response("partial", finish_reason="RECITATION")],
+        [_response("partial", finish_reason="SAFETY"), _response("partial", finish_reason="SAFETY")],
     )
 
     with pytest.raises(GeminiNoTextError):
@@ -242,10 +283,11 @@ def test_non_pdf_does_not_use_chunk_attempt(monkeypatch):
 
 
 def test_chunk_alternate_failure_reports_page_range(monkeypatch):
-    blocked = _response("partial", finish_reason="RECITATION")
+    blocked = _response("partial", finish_reason="SAFETY")
+    alternate_blocked = _response("partial", finish_reason="RECITATION")
     conv = _converter(
         monkeypatch,
-        [blocked, blocked, blocked, blocked],
+        [blocked, blocked, blocked, alternate_blocked],
         chunk_pages=5,
     )
 
@@ -254,7 +296,9 @@ def test_chunk_alternate_failure_reports_page_range(monkeypatch):
 
     assert "pages 1-5" in str(exc_info.value)
     assert "RECITATION" in str(exc_info.value)
+    assert exc_info.value.recitation is True
     assert len(conv._client.models.calls) == 4
+    assert _user_text(conv._client.models.calls[3]) == ALT_USER_PROMPT
 
 
 def test_describe_image_uses_configured_temperature(monkeypatch):

@@ -37,6 +37,10 @@ def _is_retryable(exc: Exception) -> bool:
 class GeminiNoTextError(ConversionError):
     """Gemini answered but did not provide usable text."""
 
+    def __init__(self, message: str, *, recitation: bool = False) -> None:
+        super().__init__(message)
+        self.recitation = recitation
+
 
 SYSTEM_PROMPT = """\
 You are an expert document transcription engine. Convert the attached document
@@ -132,6 +136,7 @@ class GeminiConverter(Converter):
         temperature: float = DEFAULT_TEMPERATURE,
         fallback_model: str | None = None,
         chunk_pages: int = DEFAULT_CHUNK_PAGES,
+        fail_fast_on_recitation: bool = False,
         max_continuations: int = 30,
         retries: int = DEFAULT_RETRIES,
         request_timeout: float = 300.0,
@@ -141,6 +146,7 @@ class GeminiConverter(Converter):
         self.temperature = temperature
         self.fallback_model = fallback_model
         self.chunk_pages = chunk_pages
+        self.fail_fast_on_recitation = fail_fast_on_recitation
         self.max_continuations = max_continuations
         self.retries = retries
         self.request_timeout = request_timeout
@@ -173,7 +179,7 @@ class GeminiConverter(Converter):
         client = self._get_client()
         mime = guess_mime(filename)
         uploaded = None
-        failures: list[tuple[str, str]] = []
+        failures: list[tuple[str, GeminiNoTextError]] = []
         try:
             if len(data) <= INLINE_LIMIT_BYTES:
                 doc_part = types.Part.from_bytes(data=data, mime_type=mime)
@@ -185,39 +191,69 @@ class GeminiConverter(Converter):
             if self.fallback_model and self.fallback_model != self.model:
                 models.append(self.fallback_model)
 
-            full_attempts = []
+            skip_fallback_full = False
             for model in models:
-                full_attempts.append((model, "Convert this document to Markdown.", f"{model}/full"))
-                full_attempts.append((model, ALT_USER_PROMPT, f"{model}/full-alt"))
-
-            for model, prompt, label in full_attempts:
-                try:
-                    text = self._transcribe(client, types, doc_part, model=model, user_prompt=prompt)
-                except GeminiNoTextError as exc:
-                    failures.append((label, str(exc)))
-                else:
-                    return self._finish_attempt(text, filename, label, failures)
+                if skip_fallback_full:
+                    break
+                for prompt, suffix in (
+                    ("Convert this document to Markdown.", "full"),
+                    (ALT_USER_PROMPT, "full-alt"),
+                ):
+                    label = f"{model}/{suffix}"
+                    try:
+                        text = self._transcribe(client, types, doc_part, model=model, user_prompt=prompt)
+                    except GeminiNoTextError as exc:
+                        failures.append((label, exc))
+                        if self.fail_fast_on_recitation and exc.recitation:
+                            raise self._summary_error(filename, failures)
+                        if suffix == "full" and exc.recitation:
+                            if model == self.model:
+                                skip_fallback_full = True
+                            break
+                    else:
+                        return self._finish_attempt(text, filename, label, failures)
 
             if Path(filename).suffix.lower() == ".pdf" and self.chunk_pages > 0:
                 if self._pdf_page_count(data) > self.chunk_pages:
+                    skip_fallback_chunks = False
                     for model in models:
+                        if skip_fallback_chunks:
+                            break
                         label = f"{model}/chunks"
                         try:
                             text = self._transcribe_chunks(client, types, data, model=model)
                         except GeminiNoTextError as exc:
-                            failures.append((label, str(exc)))
+                            failures.append((label, exc))
+                            if self.fail_fast_on_recitation and exc.recitation:
+                                raise self._summary_error(filename, failures)
+                            if model == self.model and exc.recitation:
+                                skip_fallback_chunks = True
                         else:
                             return self._finish_attempt(text, filename, label, failures)
 
-            details = "; ".join(f"{label}: {diagnostic}" for label, diagnostic in failures)
-            raise GeminiNoTextError(
-                f"{filename}: Gemini returned no usable text after {len(failures)} attempt(s): {details}"
-            )
+            raise self._summary_error(filename, failures)
         finally:
             if uploaded is not None:
                 self._delete_upload(client, uploaded)
 
-    def _finish_attempt(self, text: str, filename: str, label: str, failures: list[tuple[str, str]]) -> str:
+    def _summary_error(
+        self,
+        filename: str,
+        failures: list[tuple[str, GeminiNoTextError]],
+    ) -> GeminiNoTextError:
+        details = "; ".join(f"{label}: {diagnostic}" for label, diagnostic in failures)
+        return GeminiNoTextError(
+            f"{filename}: Gemini returned no usable text after {len(failures)} attempt(s): {details}",
+            recitation=any(error.recitation for _, error in failures),
+        )
+
+    def _finish_attempt(
+        self,
+        text: str,
+        filename: str,
+        label: str,
+        failures: list[tuple[str, GeminiNoTextError]],
+    ) -> str:
         if failures:
             earlier = "; ".join(f"{attempt}: {diagnostic}" for attempt, diagnostic in failures)
             logging.getLogger(__name__).warning(f"{filename}: converted via {label} after: {earlier}")
@@ -244,7 +280,7 @@ class GeminiConverter(Converter):
                 history.append(types.Content(role="user", parts=[types.Part.from_text(text=CONTINUE_PROMPT)]))
                 continue
             if finish not in (None, "", "STOP", "FINISH_REASON_UNSPECIFIED"):
-                raise GeminiNoTextError(_diagnose(response))
+                raise GeminiNoTextError(_diagnose(response), recitation=finish == "RECITATION")
             else:
                 break
         else:
@@ -273,6 +309,11 @@ class GeminiConverter(Converter):
                         user_prompt="Convert this document to Markdown.",
                     )
                 except GeminiNoTextError as normal_error:
+                    if normal_error.recitation:
+                        raise GeminiNoTextError(
+                            f"pages {start}-{end}: {normal_error}",
+                            recitation=True,
+                        ) from normal_error
                     try:
                         text = self._transcribe(
                             client,
@@ -284,7 +325,8 @@ class GeminiConverter(Converter):
                     except GeminiNoTextError as alternate_error:
                         raise GeminiNoTextError(
                             f"pages {start}-{end}: normal prompt: {normal_error}; "
-                            f"alternate prompt: {alternate_error}"
+                            f"alternate prompt: {alternate_error}",
+                            recitation=normal_error.recitation or alternate_error.recitation,
                         ) from alternate_error
                 output.append(text.strip())
             finally:

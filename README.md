@@ -69,6 +69,7 @@ pdftomd sync ./docs ./docs-md --engine gemini --gemini-model <other-model>   # o
 pdftomd sync ./docs ./docs-md --engine gemini --workers 8   # parallel API calls (default 5)
 pdftomd sync ./docs ./docs-md --engine gemini --gemini-temperature 1.0
 pdftomd sync ./docs ./docs-md --engine gemini --gemini-fallback-model gemini-4-argon --gemini-chunk-pages 5
+pdftomd sync ./docs ./docs-md --engine gemini --fallback-engine marker --gemini-fallback-model gemini-4-argon
 
 # Force specific files (relative to the source dir), even if up to date.
 pdftomd sync ./docs ./docs-md --select reports/2024/q3.pdf --select scans/invoice.png
@@ -228,11 +229,24 @@ implement `convert_bytes(data, *, filename) -> str`.
 When Gemini returns no usable text, the `FAILED` message includes its
 diagnostic, such as `finish_reason=RECITATION` or `finish_reason=SAFETY`.
 Gemini 3+ uses the recommended sampling temperature of `1.0` by default.
-pdftomd retries with an alternate user prompt, then (if configured) a fallback
-model, and finally converts eligible PDFs in page chunks; chunking can split
-tables that span chunk boundaries. `--gemini-fallback-model gemini-4-argon`
-can help with files blocked by the primary model, but it is paid-tier only,
-pricier, and only used for files whose earlier attempts return no text.
+For ordinary blocked or empty responses, pdftomd tries an alternate user
+prompt, then (if configured) a fallback model, and finally converts eligible
+PDFs in page chunks; chunking can split tables that span chunk boundaries.
+RECITATION means Gemini refuses to reproduce text matching public sources,
+often published standard terms or contracts; there is no API switch to disable
+it. A RECITATION response skips the alternate prompt and Gemini fallback model.
+`--gemini-fallback-model gemini-4-argon` can help with other files blocked by
+the primary model, but it is paid-tier only, pricier, and only used for files
+whose earlier attempts return no text.
+
+Use `--fallback-engine marker` to convert Gemini no-text failures locally:
+
+```bash
+pdftomd sync ./docs ./docs-md --engine gemini --fallback-engine marker --gemini-fallback-model gemini-4-argon
+```
+
+Marker runs locally and can be slow (about 10 minutes for a long scan on a
+Mac). The manifest continues to record the engine as `gemini`.
 
 ## Troubleshooting
 

@@ -11,6 +11,7 @@ import typer
 from . import __version__
 from .converters import ENGINES, ConversionError, get_converter
 from .converters.base import MIN_CONTENT_CHARS, ensure_content
+from .converters.fallback import FallbackConverter
 from .converters.gemini import DEFAULT_CHUNK_PAGES, DEFAULT_MODEL, DEFAULT_TEMPERATURE
 from .sync import ManualAction, PlannedItem, Reason, Syncer, SyncPlan
 
@@ -33,6 +34,7 @@ GeminiTimeout = typer.Option(300.0, "--gemini-timeout", help="(gemini) Per-reque
 GeminiTemperature = typer.Option(DEFAULT_TEMPERATURE, "--gemini-temperature", min=0.0, max=2.0, help="(gemini) Sampling temperature; Google recommends 1.0 for Gemini 3+.")
 GeminiFallback = typer.Option(None, "--gemini-fallback-model", help="(gemini) Model retried when the main model returns no text (e.g. gemini-4-argon, paid tier only).")
 GeminiChunkPages = typer.Option(DEFAULT_CHUNK_PAGES, "--gemini-chunk-pages", min=0, help="(gemini) Last resort for blocked/empty answers: convert the PDF N pages at a time (0 disables).")
+FallbackEngine = typer.Option(None, "--fallback-engine", help="(gemini) Local engine used when Gemini returns no text (e.g. RECITATION). Only 'marker' is supported.")
 Workers = typer.Option(5, "--workers", "-j", min=1, help="Number of documents converted in parallel (gemini engine only; marker always uses 1).")
 MinChars = typer.Option(MIN_CONTENT_CHARS, "--min-chars", min=0, help="Fail a conversion whose Markdown has fewer non-whitespace characters than this (engine output only; 0 disables).")
 ExcludeName = typer.Option(None, "--exclude-name", "-x", help="Skip files/directories whose name fully matches this regex (any depth). Repeatable.")
@@ -63,21 +65,34 @@ def _converter(
     temperature: float = DEFAULT_TEMPERATURE,
     fallback_model: Optional[str] = None,
     chunk_pages: int = DEFAULT_CHUNK_PAGES,
+    fallback_engine: Optional[str] = None,
 ):
     engine = engine.lower()
     if engine not in ENGINES:
         raise typer.BadParameter(f"engine must be one of {ENGINES}")
+    if fallback_engine is not None:
+        fallback_engine = fallback_engine.lower()
+        if fallback_engine != "marker":
+            raise typer.BadParameter("only 'marker' is supported for --fallback-engine")
+        if engine != "gemini":
+            raise typer.BadParameter("--fallback-engine is only valid with --engine gemini")
     if engine == "marker":
         return get_converter("marker", force_ocr=force_ocr, use_llm=use_llm, languages=langs or None)
-    return get_converter(
-        "gemini",
-        model=model,
-        api_key=api_key,
-        request_timeout=timeout,
-        temperature=temperature,
-        fallback_model=fallback_model,
-        chunk_pages=chunk_pages,
-    )
+    gemini_options = {
+        "model": model,
+        "api_key": api_key,
+        "request_timeout": timeout,
+        "temperature": temperature,
+        "fallback_model": fallback_model,
+        "chunk_pages": chunk_pages,
+    }
+    if fallback_engine == "marker":
+        gemini_options["fail_fast_on_recitation"] = True
+    gemini = get_converter("gemini", **gemini_options)
+    if fallback_engine == "marker":
+        marker = get_converter("marker", force_ocr=force_ocr, use_llm=use_llm, languages=langs or None)
+        return FallbackConverter(gemini, marker)
+    return gemini
 
 
 def _describer(
@@ -217,6 +232,7 @@ def sync(
     gemini_temperature: float = GeminiTemperature,
     gemini_fallback_model: Optional[str] = GeminiFallback,
     gemini_chunk_pages: int = GeminiChunkPages,
+    fallback_engine: Optional[str] = FallbackEngine,
 ) -> None:
     """Synchronise SOURCE into DEST, regenerating only stale Markdown files."""
     conv = _converter(
@@ -230,6 +246,7 @@ def sync(
         temperature=gemini_temperature,
         fallback_model=gemini_fallback_model,
         chunk_pages=gemini_chunk_pages,
+        fallback_engine=fallback_engine,
     )
     syncer = _syncer(
         source,
@@ -285,6 +302,7 @@ def convert(
     gemini_temperature: float = GeminiTemperature,
     gemini_fallback_model: Optional[str] = GeminiFallback,
     gemini_chunk_pages: int = GeminiChunkPages,
+    fallback_engine: Optional[str] = FallbackEngine,
 ) -> None:
     """Convert a single document (or Google Drive stub) and print the Markdown to stdout."""
     from .gdrive import GoogleDriveResolver, is_stub
@@ -300,6 +318,7 @@ def convert(
         temperature=gemini_temperature,
         fallback_model=gemini_fallback_model,
         chunk_pages=gemini_chunk_pages,
+        fallback_engine=fallback_engine,
     )
     started = time.monotonic()
     try:
@@ -355,6 +374,7 @@ def watch(
     gemini_temperature: float = GeminiTemperature,
     gemini_fallback_model: Optional[str] = GeminiFallback,
     gemini_chunk_pages: int = GeminiChunkPages,
+    fallback_engine: Optional[str] = FallbackEngine,
     adopt: bool = Adopt,
     overwrite_edited: bool = OverwriteEdited,
 ) -> None:
@@ -370,6 +390,7 @@ def watch(
         temperature=gemini_temperature,
         fallback_model=gemini_fallback_model,
         chunk_pages=gemini_chunk_pages,
+        fallback_engine=fallback_engine,
     )
     syncer = _syncer(
         source,
