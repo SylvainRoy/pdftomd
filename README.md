@@ -89,8 +89,15 @@ hash changed, the engine changed, its `.md` is missing, or it was selected /
 forced. A touched-but-identical file is *not* regenerated. A document moved or
 renamed within the source tree (same content, new path) is reported as `moved`:
 its existing `.md` is relocated in the destination, nothing is reconverted.
-Destination files whose source vanished are reported as orphans and only
-deleted with `--prune`.
+Outputs whose source vanished or became excluded are reported as orphans and
+are deleted only with `--prune`.
+
+Hand-written `.md` files in the destination are registered by default with
+manifest engine `manual`; their edits, moves and removals are tracked, and
+`--prune` never deletes them. Use `--no-adopt` to report untracked Markdown as
+orphans instead. Generated Markdown edited by hand is reported as `[edited]`
+and is not overwritten on regeneration, even with `--force`; use `--select` on
+the source file or `--overwrite-edited` to replace it.
 
 Engine output with fewer than `--min-chars` non-whitespace characters
 (default: 10) is reported as `FAILED` and no `.md` is written; the file is
