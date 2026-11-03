@@ -230,6 +230,24 @@ def test_gemini_options_reach_converter(tree, monkeypatch):
     assert captured["fallback_engine"] == "marker"
 
 
+def test_cli_gemini_timeout_defaults_to_900(tree, monkeypatch):
+    src, dst = tree
+    captured = {}
+
+    def fake_get_converter(name, **kwargs):
+        captured.update(kwargs)
+        return FakeConverter()
+
+    monkeypatch.setattr(cli, "get_converter", fake_get_converter)
+    monkeypatch.setattr(cli, "_resolver", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "_describer", lambda *args, **kwargs: None)
+
+    result = runner.invoke(cli.app, ["sync", str(src), str(dst), "--engine", "gemini", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert captured["request_timeout"] == 900.0
+
+
 def test_fallback_engine_marker_builds_wrapper(monkeypatch):
     created = []
 

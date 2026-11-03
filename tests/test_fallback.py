@@ -10,7 +10,7 @@ import pytest
 from pdftomd import MANIFEST_NAME, Syncer
 from pdftomd.converters.base import ConversionError, Converter
 from pdftomd.converters.fallback import FallbackConverter
-from pdftomd.converters.gemini import GeminiNoTextError
+from pdftomd.converters.gemini import GeminiNoTextError, GeminiUnavailableError
 
 
 class StubConverter(Converter):
@@ -50,6 +50,15 @@ def test_fallback_returns_output_and_preserves_primary_name():
     assert converter.name == "gemini"
     assert converter.extensions == primary.extensions
     assert converter.parallel_safe is primary.parallel_safe
+
+
+def test_unavailable_error_triggers_marker_fallback():
+    primary = StubConverter("gemini", error=GeminiUnavailableError("server deadline", deadline=True))
+    fallback = StubConverter("marker", output="# marker output\n")
+    converter = FallbackConverter(primary, fallback)
+
+    assert converter.convert_bytes(b"pdf", filename="document.pdf") == "# marker output\n"
+    assert fallback.calls == ["document.pdf"]
 
 
 def test_primary_conversion_error_does_not_trigger_fallback():

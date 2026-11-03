@@ -226,9 +226,13 @@ implement `convert_bytes(data, *, filename) -> str`.
   guess, temperature 1.0). Files over ~20 MB go through the Files API; output
   truncated at the token limit is continued automatically. Documents are
   converted `--workers` at a time (default 5); marker always runs one at a time
-  because its models are shared. Every API call has a 300 s timeout
-  (`--gemini-timeout`); 429/5xx responses and timeouts are retried up to 6 times
-  with exponential backoff (up to 60 s), while other 4xx errors fail immediately.
+  because its models are shared. Every API call has a 900 s timeout by default
+  (`--gemini-timeout`), also sent to Google as its server deadline. A 504
+  `DEADLINE_EXCEEDED` is not retried: eligible PDFs move to chunks, then the
+  fallback model is tried, followed by `--fallback-engine marker`. A 503 that
+  persists after six attempts advances to the fallback model, then marker.
+  Persistent 429/500 responses and network timeouts still fail the file after
+  retries; sync will retry it next run. Other 4xx errors fail immediately.
 
 ### Blocked or empty Gemini answers
 
