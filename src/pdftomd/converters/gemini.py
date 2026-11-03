@@ -13,6 +13,7 @@ from .base import ConversionError, Converter, guess_mime
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_TEMPERATURE = 1.0
+DEFAULT_TIMEOUT = 900.0
 DEFAULT_CHUNK_PAGES = 5
 DEFAULT_RETRIES = 6
 BACKOFF_BASE = 2.0
@@ -34,12 +35,30 @@ def _is_retryable(exc: Exception) -> bool:
     return True
 
 
+def _api_code(exc: Exception) -> int | None:
+    try:
+        from google.genai import errors
+    except ImportError:
+        return None
+    if isinstance(exc, errors.APIError):
+        return getattr(exc, "code", None)
+    return None
+
+
 class GeminiNoTextError(ConversionError):
     """Gemini answered but did not provide usable text."""
 
     def __init__(self, message: str, *, recitation: bool = False) -> None:
         super().__init__(message)
         self.recitation = recitation
+
+
+class GeminiUnavailableError(GeminiNoTextError):
+    """Gemini gave no answer: model overloaded (503 after retries) or server deadline exceeded (504)."""
+
+    def __init__(self, message: str, *, deadline: bool) -> None:
+        super().__init__(message)
+        self.deadline = deadline
 
 
 SYSTEM_PROMPT = """\
@@ -122,7 +141,9 @@ class GeminiConverter(Converter):
     uploaded through the Files API and deleted afterwards. If the answer hits
     the output-token limit, the conversation is continued until complete.
     Blocked/empty answers retry with an alternate user prompt, optional fallback
-    model, and page chunks for long PDFs.
+    model, and page chunks for long PDFs. A 504 server deadline is not retried;
+    persistent 503 overloads and deadline failures advance through eligible
+    chunks and fallback models.
     """
 
     name = "gemini"
@@ -139,7 +160,7 @@ class GeminiConverter(Converter):
         fail_fast_on_recitation: bool = False,
         max_continuations: int = 30,
         retries: int = DEFAULT_RETRIES,
-        request_timeout: float = 300.0,
+        request_timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         self.api_key = api_key or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         self.model = model
@@ -176,10 +197,17 @@ class GeminiConverter(Converter):
         from ..pdfcheck import ensure_pdf_readable
 
         ensure_pdf_readable(data, filename=filename)
+        file_suffix = Path(filename).suffix.lower()
+        chunkable = (
+            file_suffix == ".pdf"
+            and self.chunk_pages > 0
+            and self._pdf_page_count(data) > self.chunk_pages
+        )
         client = self._get_client()
         mime = guess_mime(filename)
         uploaded = None
         failures: list[tuple[str, GeminiNoTextError]] = []
+        unavailable: set[str] = set()
         try:
             if len(data) <= INLINE_LIMIT_BYTES:
                 doc_part = types.Part.from_bytes(data=data, mime_type=mime)
@@ -191,10 +219,12 @@ class GeminiConverter(Converter):
             if self.fallback_model and self.fallback_model != self.model:
                 models.append(self.fallback_model)
 
-            skip_fallback_full = False
+            skip_full = False
             for model in models:
-                if skip_fallback_full:
+                if skip_full:
                     break
+                if model in unavailable:
+                    continue
                 for prompt, suffix in (
                     ("Convert this document to Markdown.", "full"),
                     (ALT_USER_PROMPT, "full-alt"),
@@ -206,30 +236,42 @@ class GeminiConverter(Converter):
                         failures.append((label, exc))
                         if self.fail_fast_on_recitation and exc.recitation:
                             raise self._summary_error(filename, failures)
+                        if isinstance(exc, GeminiUnavailableError):
+                            if exc.deadline:
+                                if chunkable:
+                                    skip_full = True
+                            else:
+                                unavailable.add(model)
+                            break
                         if suffix == "full" and exc.recitation:
                             if model == self.model:
-                                skip_fallback_full = True
+                                skip_full = True
                             break
                     else:
                         return self._finish_attempt(text, filename, label, failures)
 
-            if Path(filename).suffix.lower() == ".pdf" and self.chunk_pages > 0:
-                if self._pdf_page_count(data) > self.chunk_pages:
-                    skip_fallback_chunks = False
-                    for model in models:
-                        if skip_fallback_chunks:
-                            break
-                        label = f"{model}/chunks"
-                        try:
-                            text = self._transcribe_chunks(client, types, data, model=model)
-                        except GeminiNoTextError as exc:
-                            failures.append((label, exc))
-                            if self.fail_fast_on_recitation and exc.recitation:
-                                raise self._summary_error(filename, failures)
-                            if model == self.model and exc.recitation:
-                                skip_fallback_chunks = True
-                        else:
-                            return self._finish_attempt(text, filename, label, failures)
+            if chunkable:
+                skip_fallback_chunks = False
+                for model in models:
+                    if skip_fallback_chunks:
+                        break
+                    if model in unavailable:
+                        continue
+                    label = f"{model}/chunks"
+                    try:
+                        text = self._transcribe_chunks(client, types, data, model=model)
+                    except GeminiNoTextError as exc:
+                        failures.append((label, exc))
+                        if self.fail_fast_on_recitation and exc.recitation:
+                            raise self._summary_error(filename, failures)
+                        if isinstance(exc, GeminiUnavailableError):
+                            if not exc.deadline:
+                                unavailable.add(model)
+                            continue
+                        if model == self.model and exc.recitation:
+                            skip_fallback_chunks = True
+                    else:
+                        return self._finish_attempt(text, filename, label, failures)
 
             raise self._summary_error(filename, failures)
         finally:
@@ -309,6 +351,11 @@ class GeminiConverter(Converter):
                         user_prompt="Convert this document to Markdown.",
                     )
                 except GeminiNoTextError as normal_error:
+                    if isinstance(normal_error, GeminiUnavailableError):
+                        raise GeminiUnavailableError(
+                            f"pages {start}-{end}: {normal_error}",
+                            deadline=normal_error.deadline,
+                        ) from normal_error
                     if normal_error.recitation:
                         raise GeminiNoTextError(
                             f"pages {start}-{end}: {normal_error}",
@@ -420,11 +467,19 @@ class GeminiConverter(Converter):
             try:
                 return client.models.generate_content(model=model, contents=contents, config=config)
             except Exception as exc:  # transient API errors (429/5xx)
+                code = _api_code(exc)
+                if code == 504:
+                    raise GeminiUnavailableError(f"Gemini request failed: {exc}", deadline=True) from exc
                 if not _is_retryable(exc):
                     raise ConversionError(f"Gemini request failed: {exc}") from exc
                 last = exc
                 if attempt + 1 < self.retries:
                     time.sleep(_backoff_delay(attempt))
+        if _api_code(last) == 503:
+            raise GeminiUnavailableError(
+                f"Gemini request failed after {self.retries} attempts: {last}",
+                deadline=False,
+            ) from last
         raise ConversionError(f"Gemini request failed after {self.retries} attempts: {last}") from last
 
 

@@ -12,7 +12,7 @@ from . import __version__
 from .converters import ENGINES, ConversionError, get_converter
 from .converters.base import MIN_CONTENT_CHARS, ensure_content
 from .converters.fallback import FallbackConverter
-from .converters.gemini import DEFAULT_CHUNK_PAGES, DEFAULT_MODEL, DEFAULT_TEMPERATURE
+from .converters.gemini import DEFAULT_CHUNK_PAGES, DEFAULT_MODEL, DEFAULT_TEMPERATURE, DEFAULT_TIMEOUT
 from .sync import ManualAction, PlannedItem, Reason, Syncer, SyncPlan
 
 app = typer.Typer(
@@ -30,7 +30,11 @@ UseLlm = typer.Option(False, "--use-llm", help="(marker) Hybrid LLM mode for bet
 Langs = typer.Option(None, "--lang", help="(marker) OCR language(s), e.g. --lang en --lang fr.")
 GeminiModel = typer.Option(DEFAULT_MODEL, "--gemini-model", help="(gemini) Model name.")
 GeminiKey = typer.Option(None, "--gemini-api-key", envvar="GEMINI_API_KEY", help="(gemini) API key.", show_default=False)
-GeminiTimeout = typer.Option(300.0, "--gemini-timeout", help="(gemini) Per-request timeout in seconds; stalled requests are retried.")
+GeminiTimeout = typer.Option(
+    DEFAULT_TIMEOUT,
+    "--gemini-timeout",
+    help="(gemini) Per-request timeout in seconds, also sent to Google as the server deadline; a 504 DEADLINE_EXCEEDED is not retried.",
+)
 GeminiTemperature = typer.Option(DEFAULT_TEMPERATURE, "--gemini-temperature", min=0.0, max=2.0, help="(gemini) Sampling temperature; Google recommends 1.0 for Gemini 3+.")
 GeminiFallback = typer.Option(None, "--gemini-fallback-model", help="(gemini) Model retried when the main model returns no text (e.g. gemini-4-argon, paid tier only).")
 GeminiChunkPages = typer.Option(DEFAULT_CHUNK_PAGES, "--gemini-chunk-pages", min=0, help="(gemini) Last resort for blocked/empty answers: convert the PDF N pages at a time (0 disables).")
@@ -60,7 +64,7 @@ def _converter(
     langs: Optional[list[str]],
     model: str,
     api_key: Optional[str],
-    timeout: float = 300.0,
+    timeout: float = DEFAULT_TIMEOUT,
     *,
     temperature: float = DEFAULT_TEMPERATURE,
     fallback_model: Optional[str] = None,

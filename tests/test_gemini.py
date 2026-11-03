@@ -12,8 +12,10 @@ from pdftomd.converters import gemini as gemini_module
 from pdftomd.converters.gemini import (
     ALT_USER_PROMPT,
     DEFAULT_MODEL,
+    DEFAULT_TIMEOUT,
     GeminiConverter,
     GeminiNoTextError,
+    GeminiUnavailableError,
 )
 
 
@@ -38,6 +40,15 @@ def _response(
         prompt_feedback=feedback,
         usage_metadata=SimpleNamespace(candidates_token_count=0, thoughts_token_count=0),
     )
+
+
+def _server_error(code: int):
+    status, message = {
+        500: ("INTERNAL", "internal error"),
+        503: ("UNAVAILABLE", "high demand"),
+        504: ("DEADLINE_EXCEEDED", "deadline exceeded"),
+    }[code]
+    return errors.ServerError(code, {"error": {"code": code, "message": message, "status": status}})
 
 
 class FakeModels:
@@ -84,6 +95,10 @@ def _pdf_bytes(page_count: int) -> bytes:
 
 def _user_text(call) -> str:
     return call[1][0].parts[-1].text
+
+
+def test_default_request_timeout_is_900_seconds():
+    assert GeminiConverter().request_timeout == DEFAULT_TIMEOUT == 900.0
 
 
 def test_stop_response_uses_default_model_and_temperature(monkeypatch):
@@ -153,6 +168,115 @@ def test_long_pdf_uses_ordered_page_chunks(monkeypatch):
         finally:
             chunk.close()
     assert page_counts == [5, 5, 2]
+
+
+def test_full_504_skips_remaining_full_attempts_and_uses_primary_chunks(monkeypatch):
+    conv = _converter(
+        monkeypatch,
+        [_server_error(504), _response("first chunk"), _response("second chunk"), _response("third chunk")],
+        fallback_model="gemini-4-argon",
+        chunk_pages=5,
+        retries=6,
+    )
+
+    result = conv.convert_bytes(_pdf_bytes(12), filename="long.pdf")
+
+    assert result == "first chunk\n\nsecond chunk\n\nthird chunk\n"
+    calls = conv._client.models.calls
+    assert [call[0] for call in calls] == ["gemini-3.8-flash"] * 4
+    assert _user_text(calls[0]) == "Convert this document to Markdown."
+    assert all(_user_text(call) == "Convert this document to Markdown." for call in calls[1:])
+
+
+def test_nonchunkable_504_skips_primary_alt_and_tries_fallback_full(monkeypatch):
+    conv = _converter(
+        monkeypatch,
+        [_server_error(504), _response("fallback result")],
+        fallback_model="gemini-4-argon",
+        retries=6,
+    )
+
+    assert conv.convert_bytes(b"image", filename="scan.png") == "fallback result\n"
+    calls = conv._client.models.calls
+    assert [call[0] for call in calls] == ["gemini-3.8-flash", "gemini-4-argon"]
+    assert all(_user_text(call) == "Convert this document to Markdown." for call in calls)
+
+
+def test_primary_persistent_503_skips_its_alt_and_chunks(monkeypatch):
+    conv = _converter(
+        monkeypatch,
+        [_server_error(503), _server_error(503), _response("fallback result")],
+        fallback_model="gemini-4-argon",
+        chunk_pages=5,
+        retries=2,
+    )
+
+    assert conv.convert_bytes(_pdf_bytes(12), filename="long.pdf") == "fallback result\n"
+    calls = conv._client.models.calls
+    assert [call[0] for call in calls] == [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash",
+        "gemini-4-argon",
+    ]
+    assert all(_user_text(call) == "Convert this document to Markdown." for call in calls)
+
+
+def test_both_models_persistently_503_raise_summary_error_without_chunks(monkeypatch):
+    conv = _converter(
+        monkeypatch,
+        [_server_error(503)] * 4,
+        fallback_model="gemini-4-argon",
+        chunk_pages=5,
+        retries=2,
+    )
+
+    with pytest.raises(GeminiNoTextError) as exc_info:
+        conv.convert_bytes(_pdf_bytes(12), filename="long.pdf")
+
+    assert len(conv._client.models.calls) == 4
+    assert "gemini-3.8-flash/full" in str(exc_info.value)
+    assert "gemini-4-argon/full" in str(exc_info.value)
+    assert "chunks" not in str(exc_info.value)
+
+
+def test_primary_chunk_503_skips_chunk_alt_and_tries_fallback_chunks(monkeypatch):
+    blocked = _response("blocked", finish_reason="SAFETY")
+    conv = _converter(
+        monkeypatch,
+        [
+            blocked,
+            blocked,
+            blocked,
+            blocked,
+            _server_error(503),
+            _server_error(503),
+            _response("fallback chunk one"),
+            _response("fallback chunk two"),
+            _response("fallback chunk three"),
+        ],
+        fallback_model="gemini-4-argon",
+        chunk_pages=5,
+        retries=2,
+    )
+
+    result = conv.convert_bytes(_pdf_bytes(12), filename="long.pdf")
+
+    assert result == "fallback chunk one\n\nfallback chunk two\n\nfallback chunk three\n"
+    calls = conv._client.models.calls
+    assert [call[0] for call in calls] == [
+        "gemini-3.8-flash",
+        "gemini-3.8-flash",
+        "gemini-4-argon",
+        "gemini-4-argon",
+        "gemini-3.8-flash",
+        "gemini-3.8-flash",
+        "gemini-4-argon",
+        "gemini-4-argon",
+        "gemini-4-argon",
+    ]
+    assert _user_text(calls[4]) == "Convert this document to Markdown."
+    assert _user_text(calls[5]) == "Convert this document to Markdown."
+    assert all(_user_text(call) == "Convert this document to Markdown." for call in calls[6:])
 
 
 def test_recitation_skips_full_fallback_and_alternate_chunk_prompt(monkeypatch):
@@ -326,6 +450,44 @@ def test_generate_retries_503_with_backoff(monkeypatch):
     assert len(delays) == 2
 
 
+def test_generate_504_is_unavailable_without_retry_or_sleep(monkeypatch):
+    delays = []
+    conv = _converter(monkeypatch, [_server_error(504)], retries=6, sleep_delays=delays)
+
+    with pytest.raises(GeminiUnavailableError) as exc_info:
+        conv._generate(conv._client, [], None, conv.model)
+
+    assert exc_info.value.deadline is True
+    assert len(conv._client.models.calls) == 1
+    assert delays == []
+
+
+def test_generate_persistent_503_is_unavailable_after_retries(monkeypatch):
+    delays = []
+    conv = _converter(monkeypatch, [_server_error(503)] * 3, retries=3, sleep_delays=delays)
+
+    with pytest.raises(GeminiUnavailableError) as exc_info:
+        conv._generate(conv._client, [], None, conv.model)
+
+    assert exc_info.value.deadline is False
+    assert "failed after 3 attempts" in str(exc_info.value)
+    assert len(conv._client.models.calls) == 3
+    assert len(delays) == 2
+
+
+def test_generate_persistent_500_remains_plain_conversion_error(monkeypatch):
+    delays = []
+    conv = _converter(monkeypatch, [_server_error(500)] * 2, retries=2, sleep_delays=delays)
+
+    with pytest.raises(ConversionError) as exc_info:
+        conv.convert_bytes(b"image", filename="scan.png")
+
+    assert not isinstance(exc_info.value, GeminiNoTextError)
+    assert "failed after 2 attempts" in str(exc_info.value)
+    assert len(conv._client.models.calls) == 2
+    assert len(delays) == 1
+
+
 def test_generate_retries_429(monkeypatch):
     rate_limited = errors.ClientError(
         429,
@@ -355,16 +517,13 @@ def test_generate_fails_fast_on_client_error(monkeypatch):
 
 
 def test_generate_exhausts_retries_without_sleeping_after_last_attempt(monkeypatch):
-    unavailable = errors.ServerError(
-        503,
-        {"error": {"code": 503, "message": "high demand", "status": "UNAVAILABLE"}},
-    )
     delays = []
-    conv = _converter(monkeypatch, [unavailable] * 6, retries=6, sleep_delays=delays)
+    conv = _converter(monkeypatch, [_server_error(503)] * 6, retries=6, sleep_delays=delays)
 
-    with pytest.raises(ConversionError, match="Gemini request failed after 6 attempts"):
-        conv.convert_bytes(b"image", filename="scan.png")
+    with pytest.raises(GeminiUnavailableError, match="Gemini request failed after 6 attempts") as exc_info:
+        conv._generate(conv._client, [], None, conv.model)
 
+    assert exc_info.value.deadline is False
     assert len(conv._client.models.calls) == 6
     assert len(delays) == 5
 
