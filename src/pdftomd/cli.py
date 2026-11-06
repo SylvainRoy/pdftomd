@@ -179,7 +179,7 @@ def _print_plan(plan: SyncPlan, *, verbose: bool) -> None:
     )
 
 
-def _run(syncer: Syncer, plan: SyncPlan, prune: bool, workers: int) -> int:
+def _run(syncer: Syncer, plan: SyncPlan, prune: bool, workers: int, *, verbose: bool = False) -> int:
     def done(item: PlannedItem, i: int, n: int, elapsed: float) -> None:
         typer.echo(f"[{i}/{n}] {item.rel_path} ({item.reason.value}) — {elapsed:.1f}s", err=True)
 
@@ -192,6 +192,13 @@ def _run(syncer: Syncer, plan: SyncPlan, prune: bool, workers: int) -> int:
     elif eff > 1 and plan.to_generate:
         typer.echo(f"-- converting with {eff} workers", err=True)
     result = syncer.execute(plan, prune=prune, workers=workers, on_done=done, on_error=error)
+    missing_urls = [rel for rel, entry in syncer.manifest.entries.items()
+                    if entry.engine != "manual" and entry.source_url is None]
+    if missing_urls:
+        typer.echo(f"-- {len(missing_urls)} tracked source(s) without a Drive URL", err=True)
+        if verbose:
+            for rel in missing_urls:
+                typer.echo(f"[  no Drive URL] {rel}", err=True)
     for path in result.removed_empty:
         typer.secho(f"  removed empty output {path}", fg=typer.colors.YELLOW, err=True)
     typer.echo(
@@ -272,7 +279,7 @@ def sync(
     _print_plan(plan, verbose=verbose or dry_run)
     if dry_run:
         raise typer.Exit(1 if plan.errors else 0)
-    raise typer.Exit(_run(syncer, plan, prune, workers))
+    raise typer.Exit(_run(syncer, plan, prune, workers, verbose=verbose))
 
 
 @app.command("list")

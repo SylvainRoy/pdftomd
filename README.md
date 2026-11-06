@@ -87,7 +87,17 @@ pdftomd watch ./docs ./docs-md --interval 30
 ### Change detection
 
 State is kept in `<dest>/.pdftomd-manifest.json` (SHA-256, size, mtime and
-engine per source file). A document is regenerated when it is new, its content
+engine per source file). Each entry also records an optional `source_url`:
+Google Docs, Sheets and Slides use their resolved document URL (including the
+stub's resource key when present); other files use the Drive ID from the
+`com.google.drivefs.item-id#S` extended attribute set by Drive for desktop.
+Missing or unreadable IDs produce `null`, never a sync error. Manual entries
+always have `source_url: null`. Existing manifests are backfilled on sync,
+without reconversion; moves recompute the URL. Dry runs never save these updates.
+Sync reports a count of tracked non-manual sources without a Drive URL, with
+per-file details under `--verbose`.
+
+A document is regenerated when it is new, its content
 hash changed, the engine changed, its `.md` is missing, or it was selected /
 forced. A touched-but-identical file is *not* regenerated. A document moved or
 renamed within the source tree (same content, new path) is reported as `moved`:

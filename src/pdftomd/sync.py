@@ -35,17 +35,21 @@ from regeneration unless explicitly selected or ``overwrite_edited`` is set.
 from __future__ import annotations
 
 import concurrent.futures
+import ctypes
 import hashlib
 import json
 import os
 import re
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Callable, Iterable
+from urllib.parse import quote
 
 from .converters.base import MIN_CONTENT_CHARS, ConversionError, Converter, ensure_content
+from .gdrive import MIME_DOC, MIME_SHEET, MIME_SLIDES, read_stub
 
 if TYPE_CHECKING:  # pragma: no cover
     from .gdrive import GoogleDriveResolver
@@ -121,6 +125,7 @@ class ManifestEntry:
     output: str
     generated_at: float
     md_sha256: str | None = None
+    source_url: str | None = None
 
     @classmethod
     def from_dict(cls, d: dict) -> "ManifestEntry":
@@ -128,6 +133,31 @@ class ManifestEntry:
         if "sha256" in d:  # manifest version 1
             d["fingerprint"] = d.pop("sha256")
         return cls(**d)
+
+
+def _read_drive_id(path: Path) -> str | None:
+    try:
+        name = b"com.google.drivefs.item-id#S"
+        if hasattr(os, "getxattr"):
+            value = os.getxattr(path, name)
+        elif sys.platform == "darwin":
+            getxattr = ctypes.CDLL(None, use_errno=True).getxattr
+            getxattr.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_void_p,
+                                 ctypes.c_size_t, ctypes.c_uint32, ctypes.c_int]
+            getxattr.restype = ctypes.c_ssize_t
+            size = getxattr(os.fsencode(path), name, None, 0, 0, 0)
+            if size <= 0:
+                return None
+            buffer = ctypes.create_string_buffer(size)
+            size = getxattr(os.fsencode(path), name, buffer, size, 0, 0)
+            if size <= 0:
+                return None
+            value = buffer.raw[:size]
+        else:
+            return None
+        return value.decode("utf-8").strip() or None
+    except (OSError, AttributeError, ValueError, UnicodeError):
+        return None
 
 
 def file_sha256(path: Path, chunk: int = 1 << 20) -> str:
@@ -209,6 +239,19 @@ class Syncer:
 
     def _is_remote(self, path: Path) -> bool:
         return self.gdrive is not None and path.suffix.lower() in self.gdrive.extensions
+
+    def _source_url(self, path: Path) -> str | None:
+        try:
+            if self._is_remote(path):
+                info = self.gdrive.describe(path)
+                kind = {MIME_DOC: "document", MIME_SHEET: "spreadsheets", MIME_SLIDES: "presentation"}[info.mime]
+                url = f"https://docs.google.com/{kind}/d/{info.doc_id}/edit"
+                key = read_stub(path).resource_key
+                return f"{url}?resourcekey={quote(key, safe='')}" if key else url
+            doc_id = _read_drive_id(path)
+            return f"https://drive.google.com/file/d/{doc_id}/view" if doc_id else None
+        except (ConversionError, OSError, ValueError, KeyError):
+            return None
 
     # -- discovery -----------------------------------------------------------
 
@@ -621,6 +664,7 @@ class Syncer:
                         output=item.destination.relative_to(self.dest_dir).as_posix(),
                         generated_at=generated_at,
                         md_sha256=md_sha256,
+                        source_url=self._source_url(item.source),
                     )
                     self.manifest.save()  # persist after each file so a crash loses nothing
                     done_index += 1
@@ -646,6 +690,8 @@ class Syncer:
                     del self.manifest.entries[rel]
         if prune or result.moved:
             self._remove_empty_dirs()
+        for rel, entry in self.manifest.entries.items():
+            entry.source_url = None if entry.engine == MANUAL_ENGINE else self._source_url(self.source_dir / rel)
         self.manifest.save()
         return result
 
